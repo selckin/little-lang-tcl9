@@ -1,0 +1,5646 @@
+diff --git i/generic/tcl.h w/generic/tcl.h
+index 99a35d428f88..63c4e84dacf2 100644
+--- i/generic/tcl.h
++++ w/generic/tcl.h
+@@ -435,10 +435,14 @@ typedef void (Tcl_ThreadCreateProc) (void *clientData);
+ #define	TCL_REG_NLSTOP		000100  /* \n doesn't match . or [^ ] */
+ #define	TCL_REG_NLANCH		000200  /* ^ matches after \n, $ before. */
+ #define	TCL_REG_NEWLINE		000300  /* Newlines are line terminators. */
+ #define	TCL_REG_CANMATCH	001000  /* Report details on partial/limited
+ 					 * matches. */
++#define TCL_REG_BYTEOFFSET	002000	/* Use byte offsets instead of
++					 * character offsets (L). */
++#define	TCL_REG_PCRE	0x08000000	/* Use the PCRE engine (L). Must not
++					 * conflict with other TCL_REG_* bits. */
+ 
+ /*
+  * Flags values passed to Tcl_RegExpExecObj.
+  */
+ 
+@@ -709,11 +713,20 @@ typedef union Tcl_ObjInternalRep {/* The internal representation: */
+  * An object stores a value as either a string, some internal representation,
+  * or both.
+  */
+ 
+ typedef struct Tcl_Obj {
++#ifndef TCL_MEM_DEBUG
++    size_t undef:1;		/* Used by L to mark an object as having the
++				 * undef value.  Steal a bit from refCount to
++				 * avoid increasing the Tcl_Obj footprint. */
++    Tcl_Size refCount:(sizeof(Tcl_Size)*8-1);
++				/* When 0 the object will be freed. */
++#else
+     Tcl_Size refCount;		/* When 0 the object will be freed. */
++    Tcl_Size undef;		/* L undef marker (see above). */
++#endif
+     char *bytes;		/* This points to the first byte of the
+ 				 * object's string representation. The array
+ 				 * must be followed by a null byte (i.e., at
+ 				 * offset length) but may also contain
+ 				 * embedded null characters. The array's
+@@ -1828,10 +1841,13 @@ typedef struct Tcl_Token {
+  * TCL_TOKEN_EXPAND_WORD -	This token is just like TCL_TOKEN_WORD except
+  *				that it marks a word that began with the
+  *				literal character prefix "{*}". This word is
+  *				marked to be expanded - that is, broken into
+  *				words after substitution is complete.
++ * TCL_TOKEN_PRAGMA -		This token handles pragma directives that might
++ *				switch the parser used. Currently only the L
++ *				language is supported.
+  */
+ 
+ #define TCL_TOKEN_WORD		1
+ #define TCL_TOKEN_SIMPLE_WORD	2
+ #define TCL_TOKEN_TEXT		4
+@@ -1839,10 +1855,11 @@ typedef struct Tcl_Token {
+ #define TCL_TOKEN_COMMAND	16
+ #define TCL_TOKEN_VARIABLE	32
+ #define TCL_TOKEN_SUB_EXPR	64
+ #define TCL_TOKEN_OPERATOR	128
+ #define TCL_TOKEN_EXPAND_WORD	256
++#define TCL_TOKEN_PRAGMA	512
+ 
+ /*
+  * Parsing error types. On any parsing error, one of these values will be
+  * stored in the error field of the Tcl_Parse structure defined below.
+  */
+diff --git i/generic/tclBasic.c w/generic/tclBasic.c
+index d0219527441b..3b72ea617de8 100644
+--- i/generic/tclBasic.c
++++ w/generic/tclBasic.c
+@@ -373,10 +373,27 @@ static const CmdInfo builtInCmds[] = {
+     {"variable",	Tcl_VariableObjCmd,	TclCompileVariableCmd,	NULL,	CMD_IS_SAFE},
+     {"while",		Tcl_WhileObjCmd,	TclCompileWhileCmd,	TclNRWhileObjCmd,	CMD_IS_SAFE},
+     {"yield",		NULL,			TclCompileYieldCmd,	TclNRYieldObjCmd,	CMD_IS_SAFE},
+     {"yieldto",		NULL,			TclCompileYieldToCmd,	TclNRYieldToObjCmd,	(CommandFlags)(CMD_IS_SAFE|CMD_COMPILES_EXPANDED)},
+ 
++    /*
++     * L Commands
++     */
++
++    {"L",		Tcl_LObjCmd,		NULL,			NULL,	CMD_IS_SAFE},
++    {"shsplit",		Tcl_ShSplitObjCmd,	NULL,			NULL,	CMD_IS_SAFE},
++    {"fgetline",	Tcl_FGetlineObjCmd,	NULL,			NULL,	CMD_IS_SAFE},
++    {"angle_read_",	Tcl_LAngleReadObjCmd,	NULL,			NULL,	CMD_IS_SAFE},
++    {"Lread_",		Tcl_LReadCmd,		NULL,			NULL,	CMD_IS_SAFE},
++    {"Lwrite_",		Tcl_LWriteCmd,		NULL,			NULL,	CMD_IS_SAFE},
++    {"Lrefcnt",		Tcl_LRefCnt,		NULL,			NULL,	CMD_IS_SAFE},
++    {"defined",		Tcl_LDefined,		NULL,			NULL,	CMD_IS_SAFE},
++    {"Lhtml",		Tcl_LHtmlObjCmd,	NULL,			NULL,	CMD_IS_SAFE},
++    {"LgetNextLine_",	Tcl_LGetNextLine,	NULL,			NULL,	CMD_IS_SAFE},
++    {"LgetNextLineInit_", Tcl_LGetNextLineInit,	NULL,			NULL,	CMD_IS_SAFE},
++    {"getdirx",		Tcl_LGetDirX,		NULL,			NULL,	CMD_IS_SAFE},
++
+     /*
+      * Commands in the OS-interface. Note that many of these are unsafe.
+      */
+ 
+     {"after",		Tcl_AfterObjCmd,	NULL,			NULL,	CMD_IS_SAFE},
+@@ -387,10 +404,12 @@ static const CmdInfo builtInCmds[] = {
+     {"exit",		Tcl_ExitObjCmd,		NULL,			NULL,	CMD_NONE},
+     {"fblocked",	Tcl_FblockedObjCmd,	NULL,			NULL,	CMD_IS_SAFE},
+     {"fconfigure",	Tcl_FconfigureObjCmd,	NULL,			NULL,	CMD_NONE},
+     {"fcopy",		Tcl_FcopyObjCmd,	NULL,			NULL,	CMD_IS_SAFE},
+     {"fileevent",	Tcl_FileEventObjCmd,	NULL,			NULL,	CMD_IS_SAFE},
++    {"getopt",		Tcl_GetOptObjCmd,	NULL,			NULL,	CMD_IS_SAFE},
++    {"getoptReset",	Tcl_GetOptResetObjCmd,	NULL,			NULL,	CMD_IS_SAFE},
+     {"flush",		Tcl_FlushObjCmd,	NULL,			NULL,	CMD_IS_SAFE},
+     {"gets",		Tcl_GetsObjCmd,		NULL,			NULL,	CMD_IS_SAFE},
+     {"glob",		Tcl_GlobObjCmd,		NULL,			NULL,	CMD_NONE},
+     {"load",		Tcl_LoadObjCmd,		NULL,			NULL,	CMD_NONE},
+     {"open",		Tcl_OpenObjCmd,		NULL,			NULL,	CMD_NONE},
+@@ -939,10 +958,21 @@ Tcl_CreateInterp(void)
+     iPtr->compiledProcPtr = NULL;
+     iPtr->resolverPtr = NULL;
+     iPtr->evalFlags = 0;
+     iPtr->scriptFile = NULL;
+     iPtr->flags = 0;
++#ifdef HAVE_PCRE
++#ifdef USE_DEFAULT_PCRE
++    if (getenv("TCL_REGEXP_CLASSIC") == NULL) {
++	iPtr->flags |= INTERP_PCRE;
++    }
++#else
++    if (getenv("TCL_REGEXP_PCRE") != NULL) {
++	iPtr->flags |= INTERP_PCRE;
++    }
++#endif
++#endif
+     iPtr->tracePtr = NULL;
+     iPtr->tracesForbiddingInline = 0;
+     iPtr->activeCmdTracePtr = NULL;
+     iPtr->activeInterpTracePtr = NULL;
+     iPtr->assocData = NULL;
+@@ -5393,16 +5423,21 @@ TclEvalEx(
+ 
+ 	    /*
+ 	     * Generate an array of objects for the words of the command.
+ 	     */
+ 
+-	    if (numWords > minObjs) {
+-		expand = (char *)Tcl_Alloc(numWords * sizeof(char));
++	    /*
++	     * Allow one extra word for the --line=%d argument that is
++	     * injected into L commands (see below).
++	     */
++
++	    if (numWords + 1 > minObjs) {
++		expand = (char *)Tcl_Alloc((numWords + 1) * sizeof(char));
+ 		objvSpace = (Tcl_Obj **)
+-			Tcl_Alloc(numWords * sizeof(Tcl_Obj *));
++			Tcl_Alloc((numWords + 1) * sizeof(Tcl_Obj *));
+ 		lineSpace = (int *)
+-			Tcl_Alloc(numWords * sizeof(int));
++			Tcl_Alloc((numWords + 1) * sizeof(int));
+ 	    }
+ 	    expandRequested = false;
+ 	    objv = objvSpace;
+ 	    lines = lineSpace;
+ 
+@@ -5467,10 +5502,32 @@ TclEvalEx(
+ 
+ 		if (wordCLNext) {
+ 		    TclContinuationsEnterDerived(objv[objectsUsed],
+ 			    wordStart - outerScript, wordCLNext);
+ 		}
++
++		/*
++		 * If this is the L command and we just processed the first
++		 * command word (i.e., the "L"), inject an argument --line=%d
++		 * before the next command word.  This communicates the source
++		 * line # to the L compiler.
++		 */
++
++		if ((objectsUsed == 0) && !expand[0]) {
++		    const char *cmdName = TclGetString(objv[0]);
++
++		    if (!strcmp(cmdName, "L") || !strcmp(cmdName, "Lhtml")) {
++			++numWords;
++			++objectsUsed;
++			++objectsNeeded;
++			objv[objectsUsed] = Tcl_ObjPrintf("--line=%d",
++				lines[0] + 1);
++			Tcl_IncrRefCount(objv[objectsUsed]);
++			expand[objectsUsed] = 0;
++			lines[objectsUsed] = -1;
++		    }
++		}
+ 	    } /* for loop */
+ 	    iPtr->cmdFramePtr = eeFramePtr;
+ 	    if (code != TCL_OK) {
+ 		goto error;
+ 	    }
+diff --git i/generic/tclCmdMZ.c w/generic/tclCmdMZ.c
+index 9db909f0cfcd..9b22d5fa8d0e 100644
+--- i/generic/tclCmdMZ.c
++++ w/generic/tclCmdMZ.c
+@@ -170,10 +170,51 @@ Tcl_PwdObjCmd(
+     Tcl_SetObjResult(interp, retVal);
+     Tcl_DecrRefCount(retVal);
+     return TCL_OK;
+ }
+ 
++/*
++ *----------------------------------------------------------------------
++ *
++ * GetRegExpOfType --
++ *
++ *	Compile a regexp for [regexp] or [regsub] using the requested RE
++ *	engine (classic or PCRE), regardless of the interp's default engine
++ *	(see [interp regexp]).
++ *
++ *----------------------------------------------------------------------
++ */
++
++static const char *const reTypeOptions[] = {
++    "classic",	"pcre",	NULL
++};
++enum reTypeOptionsEnum {
++    RETYPE_CLASSIC,	RETYPE_PCRE
++};
++
++static Tcl_RegExp
++GetRegExpOfType(
++    Tcl_Interp *interp,
++    Tcl_Obj *patternObj,
++    int cflags,
++    int usePcre)
++{
++    Interp *iPtr = (Interp *) interp;
++    int savedPcre = iPtr->flags & INTERP_PCRE;
++    Tcl_RegExp regExpr;
++
++    if (usePcre) {
++	cflags |= TCL_REG_PCRE;
++    } else {
++	/* Prevent the classic type from being overridden. */
++	iPtr->flags &= ~INTERP_PCRE;
++    }
++    regExpr = Tcl_GetRegExpFromObj(interp, patternObj, cflags);
++    iPtr->flags = (iPtr->flags & ~INTERP_PCRE) | savedPcre;
++    return regExpr;
++}
++
+ /*
+  *----------------------------------------------------------------------
+  *
+  * Tcl_RegexpObjCmd --
+  *
+@@ -195,25 +236,27 @@ Tcl_RegexpObjCmd(
+     Tcl_Interp *interp,		/* Current interpreter. */
+     Tcl_Size objc,		/* Number of arguments. */
+     Tcl_Obj *const *objv)	/* Argument objects. */
+ {
+     Tcl_Size i, about, all, offset, stringLength, matchLength, numMatchesSaved;
+-    int indices, match, doinline, cflags, eflags;
++    int indices, match, doinline, cflags, eflags, reType;
+     Tcl_RegExp regExpr;
+     Tcl_Obj *objPtr, *startIndex = NULL, *resultPtr = NULL;
+     Tcl_RegExpInfo info;
+     static const char *const options[] = {
+ 	"-all",		"-about",	"-indices",	"-inline",
+ 	"-expanded",	"-line",	"-linestop",	"-lineanchor",
+-	"-nocase",	"-start",	"--",		NULL
++	"-nocase",	"-start",	"-type",	"--",		NULL
+     };
+     enum regexpoptions {
+ 	REGEXP_ALL,	REGEXP_ABOUT,	REGEXP_INDICES,	REGEXP_INLINE,
+ 	REGEXP_EXPANDED,REGEXP_LINE,	REGEXP_LINESTOP,REGEXP_LINEANCHOR,
+-	REGEXP_NOCASE,	REGEXP_START,	REGEXP_LAST
++	REGEXP_NOCASE,	REGEXP_START,	REGEXP_TYPE,	REGEXP_LAST
+     } index;
+ 
++    reType = (((Interp *) interp)->flags & INTERP_PCRE)
++	    ? RETYPE_PCRE : RETYPE_CLASSIC;
+     indices = 0;
+     about = 0;
+     cflags = TCL_REG_ADVANCED;
+     offset = TCL_INDEX_START;
+     all = 0;
+@@ -271,10 +314,19 @@ Tcl_RegexpObjCmd(
+ 	    }
+ 	    startIndex = objv[i];
+ 	    Tcl_IncrRefCount(startIndex);
+ 	    break;
+ 	}
++	case REGEXP_TYPE:
++	    if (++i >= objc) {
++		goto endOfForLoop;
++	    }
++	    if (Tcl_GetIndexFromObj(interp, objv[i], reTypeOptions, "type",
++		    0, &reType) != TCL_OK) {
++		goto optionError;
++	    }
++	    break;
+ 	case REGEXP_LAST:
+ 	    i++;
+ 	    goto endOfForLoop;
+ 	default:
+ 	    TCL_UNREACHABLE();
+@@ -306,21 +358,35 @@ Tcl_RegexpObjCmd(
+     /*
+      * Handle the odd about case separately.
+      */
+ 
+     if (about) {
+-	regExpr = Tcl_GetRegExpFromObj(interp, objv[0], cflags);
+-	if ((regExpr == NULL) || (TclRegAbout(interp, regExpr) < 0)) {
++	regExpr = GetRegExpOfType(interp, objv[0], cflags,
++		reType == RETYPE_PCRE);
++	if ((regExpr == NULL) || ((reType == RETYPE_CLASSIC)
++		&& (TclRegAbout(interp, regExpr) < 0))) {
+ 	optionError:
+ 	    if (startIndex) {
+ 		Tcl_DecrRefCount(startIndex);
+ 	    }
+ 	    return TCL_ERROR;
+ 	}
+ 	return TCL_OK;
+     }
+ 
++    /*
++     * The L undef value never matches anything.
++     */
++
++    if (objv[1]->undef) {
++	if (startIndex) {
++	    Tcl_DecrRefCount(startIndex);
++	}
++	Tcl_SetObjResult(interp, Tcl_NewWideIntObj(0));
++	return TCL_OK;
++    }
++
+     /*
+      * Get the length of the string that we are matching against so we can do
+      * the termination test for -all matches. Do this before getting the
+      * regexp to avoid shimmering problems.
+      */
+@@ -334,14 +400,18 @@ Tcl_RegexpObjCmd(
+ 	if (offset < 0) {
+ 	    offset = TCL_INDEX_START;
+ 	}
+     }
+ 
+-    regExpr = Tcl_GetRegExpFromObj(interp, objv[0], cflags);
++    regExpr = GetRegExpOfType(interp, objv[0], cflags, reType == RETYPE_PCRE);
+     if (regExpr == NULL) {
+ 	return TCL_ERROR;
+     }
++    if (reType == RETYPE_PCRE) {
++	return TclRegexpPCRE(interp, objc, objv, regExpr, all, indices,
++		doinline, offset);
++    }
+ 
+     objc -= 2;
+     objv += 2;
+ 
+     if (doinline) {
+@@ -555,29 +625,33 @@ Tcl_RegsubObjCmd(
+     TCL_UNUSED(void *),
+     Tcl_Interp *interp,		/* Current interpreter. */
+     Tcl_Size objc,		/* Number of arguments. */
+     Tcl_Obj *const *objv)	/* Argument objects. */
+ {
+-    int result, cflags, all, match, command;
++    int result, cflags, all, match, command, reType;
+     Tcl_Size idx, wlen, wsublen = 0, offset, numMatches, numParts;
+-    Tcl_Size start, end, subStart, subEnd;
++    Tcl_Size start, end, subStart, subEnd, prevOffset = 0;
++    Tcl_Size subMatchVarsElemc = 0;
++    Tcl_Obj **subMatchVarsElemv = NULL;
+     Tcl_RegExp regExpr;
+     Tcl_RegExpInfo info;
+     Tcl_Obj *resultPtr, *subPtr, *objPtr, *startIndex = NULL;
+     Tcl_UniChar ch, *wsrc, *wfirstChar, *wstring, *wsubspec = 0, *wend;
+ 
+     static const char *const options[] = {
+ 	"-all",		"-command",	"-expanded",	"-line",
+ 	"-linestop",	"-lineanchor",	"-nocase",	"-start",
+-	"--",		NULL
++	"-submatches",	"-type",	"--",		NULL
+     };
+     enum regsubobjoptions {
+ 	REGSUB_ALL,	 REGSUB_COMMAND,    REGSUB_EXPANDED, REGSUB_LINE,
+ 	REGSUB_LINESTOP, REGSUB_LINEANCHOR, REGSUB_NOCASE,   REGSUB_START,
+-	REGSUB_LAST
++	REGSUB_SUBMATCHES, REGSUB_TYPE,	REGSUB_LAST
+     } index;
+ 
++    reType = (((Interp *) interp)->flags & INTERP_PCRE)
++	    ? RETYPE_PCRE : RETYPE_CLASSIC;
+     cflags = TCL_REG_ADVANCED;
+     all = 0;
+     offset = TCL_INDEX_START;
+     command = 0;
+     resultPtr = NULL;
+@@ -628,10 +702,28 @@ Tcl_RegsubObjCmd(
+ 	    }
+ 	    startIndex = objv[idx];
+ 	    Tcl_IncrRefCount(startIndex);
+ 	    break;
+ 	}
++	case REGSUB_SUBMATCHES:
++	    if (++idx >= objc) {
++		goto endOfForLoop;
++	    }
++	    if (TclListObjGetElements(interp, objv[idx], &subMatchVarsElemc,
++		    &subMatchVarsElemv) != TCL_OK) {
++		goto optionError;
++	    }
++	    break;
++	case REGSUB_TYPE:
++	    if (++idx >= objc) {
++		goto endOfForLoop;
++	    }
++	    if (Tcl_GetIndexFromObj(interp, objv[idx], reTypeOptions, "type",
++		    0, &reType) != TCL_OK) {
++		goto optionError;
++	    }
++	    break;
+ 	case REGSUB_LAST:
+ 	    idx++;
+ 	    goto endOfForLoop;
+ 	default:
+ 	    TCL_UNREACHABLE();
+@@ -731,11 +823,11 @@ Tcl_RegsubObjCmd(
+ 	objPtr = NULL;
+ 	subPtr = NULL;
+ 	goto regsubDone;
+     }
+ 
+-    regExpr = Tcl_GetRegExpFromObj(interp, objv[0], cflags);
++    regExpr = GetRegExpOfType(interp, objv[0], cflags, reType == RETYPE_PCRE);
+     if (regExpr == NULL) {
+ 	return TCL_ERROR;
+     }
+ 
+     if (command) {
+@@ -755,11 +847,12 @@ Tcl_RegsubObjCmd(
+ 		    -1));
+ 	    Tcl_SetErrorCode(interp, "TCL", "OPERATION", "REGSUB",
+ 		    "CMDEMPTY", (char *)NULL);
+ 	    return TCL_ERROR;
+ 	}
+-	regExpr = Tcl_GetRegExpFromObj(interp, objv[0], cflags);
++	regExpr = GetRegExpOfType(interp, objv[0], cflags,
++		reType == RETYPE_PCRE);
+     }
+ 
+     /*
+      * Make sure to avoid problems where the objects are shared. This can
+      * cause RegExpObj <> UnicodeObj shimmering that causes data corruption.
+@@ -811,10 +904,11 @@ Tcl_RegsubObjCmd(
+ 	    goto done;
+ 	}
+ 	if (match == 0) {
+ 	    break;
+ 	}
++	prevOffset = offset;
+ 	if (numMatches == 0) {
+ 	    resultPtr = Tcl_NewUnicodeObj(wstring, 0);
+ 	    Tcl_IncrRefCount(resultPtr);
+ 	    if (offset > TCL_INDEX_START) {
+ 		/*
+@@ -943,10 +1037,32 @@ Tcl_RegsubObjCmd(
+ 			    wsrc - wfirstChar + 1);
+ 		    *wsrc = '\\';
+ 		    wfirstChar = wsrc + 2;
+ 		    wsrc++;
+ 		    continue;
++		} else if (reType == RETYPE_PCRE) {
++		    /*
++		     * PCRE subSpecs also understand the usual C-style
++		     * character escapes; any other escaped char stands for
++		     * itself.
++		     */
++
++		    switch (ch) {
++		    case 'a': *wsrc = '\a'; break;
++		    case 'e': *wsrc = '\033'; break;
++		    case 'f': *wsrc = '\f'; break;
++		    case 'n': *wsrc = '\n'; break;
++		    case 'r': *wsrc = '\r'; break;
++		    case 't': *wsrc = '\t'; break;
++		    default:  *wsrc = ch; break;
++		    }
++		    Tcl_AppendUnicodeToObj(resultPtr, wfirstChar,
++			    wsrc - wfirstChar + 1);
++		    *wsrc = '\\';
++		    wfirstChar = wsrc + 2;
++		    wsrc++;
++		    continue;
+ 		} else {
+ 		    continue;
+ 		}
+ 	    } else {
+ 		continue;
+@@ -1003,10 +1119,36 @@ Tcl_RegsubObjCmd(
+ 	if (!all) {
+ 	    break;
+ 	}
+     }
+ 
++    /*
++     * Return the regexp submatches of the last match in the requested
++     * variables.
++     */
++
++    if (numMatches && subMatchVarsElemc) {
++	for (idx = 0; (idx <= info.nsubs) && (idx < subMatchVarsElemc);
++		++idx) {
++	    Tcl_Obj *subObj;
++
++	    subStart = info.matches[idx].start;
++	    subEnd = info.matches[idx].end;
++	    if ((subStart >= 0) && (subEnd >= 0)) {
++		subObj = Tcl_NewUnicodeObj(wstring + prevOffset + subStart,
++			subEnd - subStart);
++	    } else {
++		TclNewObj(subObj);
++	    }
++	    if (Tcl_ObjSetVar2(interp, subMatchVarsElemv[idx], NULL, subObj,
++		    TCL_LEAVE_ERR_MSG) == NULL) {
++		result = TCL_ERROR;
++		goto done;
++	    }
++	}
++    }
++
+     /*
+      * Copy the portion of the source string after the last match to the
+      * result variable.
+      */
+ 
+diff --git i/generic/tclCompCmdsGR.c w/generic/tclCompCmdsGR.c
+index 60af16bb1796..a60777d37408 100644
+--- i/generic/tclCompCmdsGR.c
++++ w/generic/tclCompCmdsGR.c
+@@ -2476,11 +2476,17 @@ TclCompileRegexpCmd(
+ 	/*
+ 	 * Attempt to convert pattern to glob.  If successful, push the
+ 	 * converted pattern as a literal.
+ 	 */
+ 
+-	if (TclReToGlob(NULL, str, len, &ds, &exact, NULL) == TCL_OK) {
++	if (!(((Interp *) interp)->flags & INTERP_PCRE)
++		&& (TclReToGlob(NULL, str, len, &ds, &exact, NULL) == TCL_OK)) {
++	    /*
++	     * (Only for Tcl's own RE syntax, not when PCRE is this interp's
++	     * default RE engine; see "interp regexp".)
++	     */
++
+ 	    simple = 1;
+ 	    TclPushDString(envPtr, &ds);
+ 	    Tcl_DStringFree(&ds);
+ 	}
+     }
+@@ -2626,11 +2632,12 @@ TclCompileRegsubCmd(
+      * Next, higher-level checks. Is the RE a very simple glob? Is the
+      * replacement "simple"?
+      */
+ 
+     bytes = TclGetStringFromObj(patternObj, &len);
+-    if (TclReToGlob(NULL, bytes, len, &pattern, &exact, &quantified)
++    if ((((Interp *) interp)->flags & INTERP_PCRE)	/* not Tcl RE syntax */
++	    || TclReToGlob(NULL, bytes, len, &pattern, &exact, &quantified)
+ 	    != TCL_OK || exact || quantified) {
+ 	goto done;
+     }
+     bytes = Tcl_DStringValue(&pattern);
+     if (*bytes++ != '*') {
+diff --git i/generic/tclCompCmdsSZ.c w/generic/tclCompCmdsSZ.c
+index a100354f9e96..47b1dabcf741 100644
+--- i/generic/tclCompCmdsSZ.c
++++ w/generic/tclCompCmdsSZ.c
+@@ -2247,11 +2247,12 @@ IssueSwitchChainedTests(
+ 		    /*
+ 		     * Attempt to convert pattern to glob. If successful, push
+ 		     * the converted pattern.
+ 		     */
+ 
+-		    if (TclReToGlob(NULL, arm->valueToken->start,
++		    if (!(((Interp *) interp)->flags & INTERP_PCRE)
++			    && TclReToGlob(NULL, arm->valueToken->start,
+ 			    arm->valueToken->size, &ds, &exact, NULL) == TCL_OK) {
+ 			simple = 1;
+ 			TclPushDString(envPtr, &ds);
+ 			Tcl_DStringFree(&ds);
+ 		    }
+diff --git i/generic/tclCompile.c w/generic/tclCompile.c
+index 7e031a2b88c0..36069ec8944b 100644
+--- i/generic/tclCompile.c
++++ w/generic/tclCompile.c
+@@ -992,10 +992,87 @@ InstructionDesc const tclInstructionTable[] = {
+ 	 * The stepIdx will be the index of the value of the opnd1'th variable
+ 	 * of the opnd0'th list of variables.
+ 	 * Stack: ... listObjs... iterTracker info =>
+ 	 *			... listObjs... iterTracker info stepIdx */
+ 
++    /*
++     * Opcodes for the L language.
++     */
++
++    TCL_INSTRUCTION_ENTRY1(
++	"rot",		  2,	0,	  OPERAND_INT1),
++	/* Rotate the top |op1| stack elements; op1 > 0 rotates stktop down
++	 * to depth op1, op1 < 0 rotates the other way. */
++    TCL_INSTRUCTION_ENTRY1(
++	"l-index",	  5,	-1,	  OPERAND_UINT4),
++	/* Index into a nested struct/array/hash. op4 contains flags, index is
++	 * stktop, object to index into is stknext. */
++    TCL_INSTRUCTION_ENTRY2(
++	"l-deep-write",	  9,	-1,	  OPERAND_LVT4, OPERAND_UINT4),
++	/* Write via L deep pointer pushed by l-index above.  op4 is a local
++	 * var index of a var that points to the top-level object being
++	 * indexed; it will be written if the top-level object needed to be
++	 * copied by l-index for copy-on-write.  The second op4 contains flags
++	 * indicating whether to leave old or new value on stack top.  stktop
++	 * is the L deep pointer, stknext is the value to write. */
++    TCL_INSTRUCTION_ENTRY1(
++	"lsplit",	  5,	0,	  OPERAND_UINT4),
++	/* Perl-like string split. op4 is a flags word (see Expr_f), stack
++	 * contains the limit (optional), then the delimeter (optional) then
++	 * the string to split. */
++    TCL_INSTRUCTION_ENTRY(
++	"l-defined",		0),
++	/* Test whether value at stktop is the L undefined value. */
++    TCL_INSTRUCTION_ENTRY(
++	"l-push-list-size",	0),
++	/* Store the size of the list at stktop in the internal L sizes
++	 * stack.  Sizes are used to implement the L END keyword. */
++    TCL_INSTRUCTION_ENTRY(
++	"l-push-string-size",	0),
++	/* Store the length of the string at stktop in the internal L sizes
++	 * stack. */
++    TCL_INSTRUCTION_ENTRY(
++	"l-read-size",		+1),
++	/* Push what's on the top of the internal L sizes stack. */
++    TCL_INSTRUCTION_ENTRY(
++	"l-pop-size",		0),
++	/* Pop the internal L sizes stack. */
++    TCL_INSTRUCTION_ENTRY(
++	"l-push-undef",		+1),
++	/* Push the L undef object. */
++    TCL_INSTRUCTION_ENTRY1(
++	"expandRot",	  2,	0,	  OPERAND_UINT1),
++	/* Rotate the top op1 stack elements with those after the expand
++	 * marker (see expandStart). */
++    TCL_INSTRUCTION_ENTRY1(
++	"l-lindex-stk",	  2,	+1,	  OPERAND_UINT1),
++	/* push(listindex stktop op1) except if op1 is <0 or > # list
++	 * elements then push the L undef object. */
++    TCL_INSTRUCTION_ENTRY2(
++	"l-list-insert",  9,	0,	  OPERAND_LVT4, OPERAND_UINT4),
++	/* Insert into list local var. Operands are local slot index and
++	 * flags; the list index to insert before (0 means prepend, -1 means
++	 * append) is stktop, the element/list to insert is stknext. */
++    TCL_INSTRUCTION_ENTRY1(
++	"unsetLocal",	  5,	0,	  OPERAND_LVT4),
++	/* Unset the local variable at index op4. */
++    TCL_INSTRUCTION_ENTRY1(
++	"different-obj",  5,	0,	  OPERAND_LVT4),
++	/* Determine whether the variable whose name is at stktop points to a
++	 * different object than the given local. */
++    TCL_INSTRUCTION_ENTRY1(
++	"l-foreach-start", 5,	0,	  OPERAND_AUX4),
++	/* Initialize execution of an L array foreach loop. Operand is the
++	 * aux data index of the ForeachInfo structure (the value lists and
++	 * the loop counter are in local temps).  Sets the loop counter to
++	 * -1. */
++    TCL_INSTRUCTION_ENTRY1(
++	"l-foreach-step", 5,	+1,	  OPERAND_AUX4),
++	/* "Step" an L array foreach loop: assign the next elements of the
++	 * value lists to the loop vars (or the L undef value if the list is
++	 * exhausted) and push 1 if there was a next iteration, else 0. */
++
+     {NULL, 0, 0, 0, {OPERAND_NONE}}
+ };
+ 
+ /*
+  * Prototypes for procedures defined later in this file:
+@@ -2147,26 +2224,55 @@ CompileCmdLiteral(
+     if (cmdPtr && TclRoutineHasName(cmdPtr)) {
+ 	TclSetCmdNameObj(interp, TclFetchLiteral(envPtr, cmdLitIdx), cmdPtr);
+     }
+ }
+ 
++/*
++ * If this is the L or Lhtml command, push the argument --line=%d to it.
++ * This communicates the source line # to the L compiler.  Returns 1 if the
++ * extra argument was pushed, 0 otherwise.
++ */
++
++static int
++PushLCommandLine(
++    Tcl_Obj *cmdObj,
++    CompileEnv *envPtr)
++{
++    const char *cmd = TclGetString(cmdObj);
++    Tcl_Obj *obj;
++    Tcl_Size len;
++    const char *s;
++
++    if (strcmp(cmd, "L") && strcmp(cmd, "Lhtml")) {
++	return 0;
++    }
++    obj = Tcl_ObjPrintf("--line=%d", envPtr->line + 1);
++    Tcl_IncrRefCount(obj);
++    s = TclGetStringFromObj(obj, &len);
++    PushLiteral(envPtr, s, len);
++    Tcl_DecrRefCount(obj);
++    return 1;
++}
++
+ void
+ TclCompileInvocation(
+     Tcl_Interp *interp,
+     Tcl_Token *tokenPtr,
+     Tcl_Obj *cmdObj,
+     size_t numWords,
+     CompileEnv *envPtr)
+ {
+     DefineLineInformation;
+     size_t wordIdx = 0;
++    int adjust = 0;
+     Tcl_Size depth = TclGetStackDepth(envPtr);
+ 
+     if (cmdObj) {
+ 	CompileCmdLiteral(interp, cmdObj, envPtr);
+ 	wordIdx = 1;
+ 	tokenPtr = TokenAfter(tokenPtr);
++	adjust = PushLCommandLine(cmdObj, envPtr);
+     }
+ 
+     for (; wordIdx < numWords; wordIdx++, tokenPtr = TokenAfter(tokenPtr)) {
+ 	int objIdx;
+ 
+@@ -2182,11 +2288,11 @@ TclCompileInvocation(
+ 	    TclContinuationsEnterDerived(TclFetchLiteral(envPtr, objIdx),
+ 		    tokenPtr[1].start - envPtr->source, envPtr->clNext);
+ 	}
+     }
+ 
+-    INVOKE4(			INVOKE_STK, wordIdx);
++    INVOKE4(			INVOKE_STK, wordIdx + adjust);
+     TclCheckStackDepth(depth+1, envPtr);
+ }
+ 
+ static void
+ CompileExpanded(
+@@ -2196,17 +2302,19 @@ CompileExpanded(
+     Tcl_Size numWords,
+     CompileEnv *envPtr)
+ {
+     DefineLineInformation;
+     Tcl_Size wordIdx = 0;
++    int adjust = 0;
+     Tcl_Size depth = TclGetStackDepth(envPtr);
+ 
+     StartExpanding(envPtr);
+     if (cmdObj) {
+ 	CompileCmdLiteral(interp, cmdObj, envPtr);
+ 	wordIdx = 1;
+ 	tokenPtr = TokenAfter(tokenPtr);
++	adjust = PushLCommandLine(cmdObj, envPtr);
+     }
+ 
+     for (; wordIdx < numWords; wordIdx++, tokenPtr = TokenAfter(tokenPtr)) {
+ 	int objIdx;
+ 
+@@ -2239,11 +2347,11 @@ CompileExpanded(
+      *
+      * The estimates are not correct while the command is being
+      * prepared and run, INST_EXPAND_STKTOP is not stack-neutral in general.
+      */
+ 
+-    INVOKE4(			INVOKE_EXPANDED, wordIdx);
++    INVOKE4(			INVOKE_EXPANDED, wordIdx + adjust);
+     TclCheckStackDepth(depth + 1, envPtr);
+ }
+ 
+ static int
+ CompileCmdCompileProc(
+diff --git i/generic/tclCompile.h w/generic/tclCompile.h
+index 0ac37591628d..e81a59711707 100644
+--- i/generic/tclCompile.h
++++ w/generic/tclCompile.h
+@@ -973,10 +973,29 @@ enum TclInstruction {
+     INST_TCLOO_NEXT_CLASS_LIST,
+     INST_ARITH_SERIES,
+     INST_UPLEVEL,
+     INST_FOREACH_INDEX,
+ 
++    /* Opcodes for the L language (see Lcompile.c) */
++    INST_ROT,
++    INST_L_INDEX,
++    INST_L_DEEP_WRITE,
++    INST_L_SPLIT,
++    INST_L_DEFINED,
++    INST_L_PUSH_LIST_SIZE,
++    INST_L_PUSH_STR_SIZE,
++    INST_L_READ_SIZE,
++    INST_L_POP_SIZE,
++    INST_L_PUSH_UNDEF,
++    INST_EXPAND_ROT,
++    INST_L_LINDEX_STK,
++    INST_L_LIST_INSERT,
++    INST_UNSET_LOCAL,
++    INST_DIFFERENT_OBJ,
++    INST_L_FOREACH_START,
++    INST_L_FOREACH_STEP,
++
+     /* The last opcode */
+     LAST_INST_OPCODE
+ };
+ 
+ /*
+diff --git i/generic/tclDisassemble.c w/generic/tclDisassemble.c
+index e7da4b77547d..ccb0fd24021b 100644
+--- i/generic/tclDisassemble.c
++++ w/generic/tclDisassemble.c
+@@ -25,10 +25,13 @@ static Tcl_Obj *	DisassembleByteCodeAsDicts(Tcl_Obj *objPtr);
+ static Tcl_Obj *	DisassembleByteCodeObj(Tcl_Obj *objPtr);
+ static int		FormatInstruction(ByteCode *codePtr,
+ 			    const unsigned char *pc, Tcl_Obj *bufferObj);
+ static void		GetLocationInformation(Proc *procPtr,
+ 			    Tcl_Obj **fileObjPtr, int *linePtr);
++static void		PrintSourceRangeToObj(Tcl_Obj *appendObj,
++			    const char *stringPtr, Tcl_Size numBytes,
++			    Tcl_Size maxChars);
+ static void		PrintSourceToObj(Tcl_Obj *appendObj,
+ 			    const char *stringPtr, Tcl_Size maxChars);
+ static void		UpdateStringOfInstName(Tcl_Obj *objPtr);
+ 
+ /*
+@@ -523,12 +526,12 @@ DisassembleByteCodeObj(
+ 	    Tcl_AppendToObj(bufferObj, "    ", -1);
+ 	    pc += FormatInstruction(codePtr, pc, bufferObj);
+ 	}
+ 
+ 	Tcl_AppendPrintfToObj(bufferObj, "  Command %" TCL_SIZE_MODIFIER "d: ", i+1);
+-	PrintSourceToObj(bufferObj, (codePtr->source + srcOffset),
+-		TclMin(srcLen, 55));
++	PrintSourceRangeToObj(bufferObj, (codePtr->source + srcOffset),
++		srcLen, 55);
+ 	Tcl_AppendToObj(bufferObj, "\n", -1);
+     }
+     if (pc < codeLimit) {
+ 	/*
+ 	 * Print instructions after the last command.
+@@ -944,21 +947,52 @@ static void
+ PrintSourceToObj(
+     Tcl_Obj *appendObj,		/* The object to print the source to. */
+     const char *stringPtr,	/* The string to print. */
+     Tcl_Size maxChars)		/* Maximum number of chars to print. */
+ {
+-    const char *p;
+-    Tcl_Size i = 0, len;
++    PrintSourceRangeToObj(appendObj, stringPtr, TCL_SIZE_MAX, maxChars);
++}
++
++/*
++ *----------------------------------------------------------------------
++ *
++ * PrintSourceRangeToObj --
++ *
++ *	Like PrintSourceToObj, but prints at most numBytes bytes of the
++ *	source. The "..." marker is only appended if the source was cut
++ *	short (by maxChars, or because the string continues beyond numBytes
++ *	when numBytes is TCL_SIZE_MAX). This makes command source text in
++ *	disassemblies exact, which the L source-mapping tests rely upon.
++ *
++ *----------------------------------------------------------------------
++ */
++
++static void
++PrintSourceRangeToObj(
++    Tcl_Obj *appendObj,		/* The object to print the source to. */
++    const char *stringPtr,	/* The string to print. */
++    Tcl_Size numBytes,		/* Maximum number of bytes to print. */
++    Tcl_Size maxChars)		/* Maximum number of chars to print. */
++{
++    const char *p, *end;
++    Tcl_Size i = 0, len, numChars = 0;
+ 
+     if (stringPtr == NULL) {
+ 	Tcl_AppendToObj(appendObj, "\"\"", -1);
+ 	return;
+     }
+ 
+     Tcl_AppendToObj(appendObj, "\"", -1);
+     p = stringPtr;
+-    for (;  (*p != '\0') && (i < maxChars);  p+=len) {
++    end = (numBytes == TCL_SIZE_MAX) ? NULL : stringPtr + numBytes;
++    /*
++     * For a source range, maxChars limits the number of source chars shown
++     * (rather than the width of the escaped output).
++     */
++
++    for (;  (*p != '\0') && (p != end)
++	    && (((end != NULL) ? numChars++ : i) < maxChars);  p+=len) {
+ 	int ucs4;
+ 
+ 	len = TclUtfToUniChar(p, &ucs4);
+ 	switch (ucs4) {
+ 	case '"':
+@@ -997,11 +1031,11 @@ PrintSourceToObj(
+ 		i++;
+ 	    }
+ 	    continue;
+ 	}
+     }
+-    if (*p != '\0') {
++    if ((*p != '\0') && (p != end)) {
+ 	Tcl_AppendToObj(appendObj, "...", -1);
+     }
+     Tcl_AppendToObj(appendObj, "\"", -1);
+ }
+ 
+@@ -1370,11 +1404,10 @@ Tcl_DisassembleObjCmd(
+     Proc *procPtr = NULL;
+     Tcl_HashEntry *hPtr;
+     Tcl_Obj *ooWhat = NULL;
+     Object *oPtr;
+     Class *classPtr;
+-    ByteCode *codePtr;
+     Method *methodPtr;
+     const char *bodyType;
+ 
+     if (objc < 2) {
+ 	Tcl_WrongNumArgs(interp, 1, objv, "type ...");
+@@ -1618,19 +1651,15 @@ Tcl_DisassembleObjCmd(
+ 
+     /*
+      * Do the actual disassembly.
+      */
+ 
+-    ByteCodeGetInternalRep(codeObjPtr, &tclByteCodeType, codePtr);
++    /*
++     * Note: precompiled bytecode is disassembled too, since L marks its
++     * compiled procs as precompiled (so they are never recompiled).
++     */
+ 
+-    if (codePtr->flags & TCL_BYTECODE_PRECOMPILED) {
+-	Tcl_SetObjResult(interp, Tcl_NewStringObj(
+-		"may not disassemble prebuilt bytecode", -1));
+-	Tcl_SetErrorCode(interp, "TCL", "OPERATION", "DISASSEMBLE",
+-		"BYTECODE", (char *)NULL);
+-	return TCL_ERROR;
+-    }
+     if (clientData) {
+ 	Tcl_SetObjResult(interp,
+ 		DisassembleByteCodeAsDicts(codeObjPtr));
+     } else {
+ 	Tcl_SetObjResult(interp,
+diff --git i/generic/tclExecute.c w/generic/tclExecute.c
+index fd43b87e0eba..3eb907107d7a 100644
+--- i/generic/tclExecute.c
++++ w/generic/tclExecute.c
+@@ -21,10 +21,12 @@
+ #define ALLOW_DEPRECATED_OPCODES
+ #endif
+ #include "tclCompile.h"
+ #include "tclOOInt.h"
+ #include "tclTomMath.h"
++#include "tclRegexp.h"
++#include "Lcompile.h"
+ #include <math.h>
+ 
+ #if defined(__GNUC__) && (__GNUC__ > 4) && defined(_WIN32) && defined(TCL_COMPILE_DEBUG)
+ // These are FAR too noisy when we're using the MSVC runtime.
+ #pragma GCC diagnostic ignored "-Wformat"
+@@ -779,10 +781,324 @@ ReleaseDictIterator(
+     Tcl_Free(searchPtr);
+ 
+     Tcl_Obj *dictPtr = (Tcl_Obj *)irPtr->twoPtrValue.ptr2;
+     TclDecrRefCount(dictPtr);
+ }
++
++/*
++ * The L "sizes stack" is a separate run-time stack managed by the
++ * INST_L_PUSH_LIST_SIZE, INST_L_PUSH_STR_SIZE, INST_L_READ_SIZE, and
++ * INST_L_POP_SIZE opcodes.  The first two push onto this stack the length
++ * (size) of the list (string) at stktop.  INST_L_READ_SIZE pushes onto the
++ * regular stack the size at the top of L sizes stack, and INST_L_POP_SIZE
++ * pops the L stack.  These are used to implement the L END keyword with
++ * minimal overhead.
++ */
++
++static Tcl_Size *L_sizes_stack = NULL;
++static Tcl_Size L_sizes_stack_top  = -1;
++static Tcl_Size L_sizes_stack_size = 0;
++
++/*
++ *----------------------------------------------------------------------
++ *
++ * L_sizes_push --
++ *
++ *	Push a size onto the internal L sizes stack.
++ *
++ *----------------------------------------------------------------------
++ */
++
++static inline void
++L_sizes_push(
++    Tcl_Size size)
++{
++    if ((L_sizes_stack_top+1) >= L_sizes_stack_size) {
++	if (L_sizes_stack_size == 0) {
++	    L_sizes_stack_size = 32;
++	} else {
++	    L_sizes_stack_size *= 2;
++	}
++	L_sizes_stack = (Tcl_Size *)Tcl_Realloc(L_sizes_stack,
++		L_sizes_stack_size * sizeof(Tcl_Size));
++    }
++    L_sizes_stack[++L_sizes_stack_top] = size;
++}
++
++/*
++ *----------------------------------------------------------------------
++ *
++ * L_sizes_top --
++ *
++ *	Return the stack top of the L internal sizes stack.  The stack must
++ *	not be empty when called.
++ *
++ *----------------------------------------------------------------------
++ */
++
++static inline Tcl_Size
++L_sizes_top(void)
++{
++    if (L_sizes_stack_top < 0) {
++	Tcl_Panic("topped empty L sizes stack");
++    }
++    return L_sizes_stack[L_sizes_stack_top];
++}
++
++/*
++ *----------------------------------------------------------------------
++ *
++ * L_sizes_pop --
++ *
++ *	Pop the L internal sizes stack.  The stack must not be empty when
++ *	called.
++ *
++ *----------------------------------------------------------------------
++ */
++
++static inline void
++L_sizes_pop(void)
++{
++    if (L_sizes_stack_top < 0) {
++	Tcl_Panic("popped empty L sizes stack");
++    }
++    --L_sizes_stack_top;
++}
++
++/*
++ * Special object types for the L language to store object pointers. These are
++ * created only by L bytecodes (INST_L_INDEX) and are left on the run-time
++ * stack only transiently to be consumed by other L bytecodes
++ * (INST_L_DEEP_WRITE).  L_deepPtr1Type is used when indexing an array or
++ * hash.  L_deepPtr2Type is used when indexing a string or doing a delete.
++ */
++
++static const Tcl_ObjType L_deepPtr1Type = {
++    "l-deepType1",
++    NULL,			/* freeIntRepProc */
++    NULL,			/* dupIntRepProc */
++    NULL,			/* updateStringProc */
++    NULL,			/* setFromAnyProc */
++    TCL_OBJTYPE_V0
++};
++static const Tcl_ObjType L_deepPtr2Type = {
++    "l-deepType2",
++    NULL,			/* freeIntRepProc */
++    NULL,			/* dupIntRepProc */
++    NULL,			/* updateStringProc */
++    NULL,			/* setFromAnyProc */
++    TCL_OBJTYPE_V0
++};
++
++/*
++ * For a L_deepPtr1Type, the internal rep fits into the Tcl_Obj internalRep
++ * field (two pointers).  For a L_deepPtr2Type, we allocate a struct and point
++ * to it from the Tcl_Obj internalRep.  The struct below is overlayed onto one
++ * of these two pieces of memory.
++ */
++
++typedef struct {
++    Tcl_Obj *topLevObj;		/* outer-most enclosing object */
++    Tcl_Obj **elemPtrPtr;	/* ptr to the object being pointed to */
++    /* The following exist only in a L_deepPtr2Type. */
++    Tcl_Obj *parentObj;		/* enclosing object */
++    Tcl_Obj *idxObj;		/* index of array/hash/string */
++    int flags;
++    Tcl_Obj *strElemObj;	/* for a string index, the (new) object
++				 * holding the indexed character; elemPtrPtr
++				 * then points here */
++} L_DeepPtr;
++
++static inline int
++L_isDeepPtr(
++    Tcl_Obj *objPtr)
++{
++    return ((objPtr->typePtr == &L_deepPtr1Type) ||
++	    (objPtr->typePtr == &L_deepPtr2Type));
++}
++
++static inline L_DeepPtr *
++L_deepPtrGet(
++    Tcl_Obj *objPtr)
++{
++    ASSERT(L_isDeepPtr(objPtr));
++    if (objPtr->typePtr == &L_deepPtr1Type) {
++	return (L_DeepPtr *)&objPtr->internalRep.twoPtrValue;
++    } else {
++	return (L_DeepPtr *)objPtr->internalRep.twoPtrValue.ptr1;
++    }
++}
++
++/*
++ * Allocate an L deep-pointer object.  flags tells us whether a small or large
++ * one is needed: a large one for an L_DELETE operation or a string index, and
++ * a small one for everything else.
++ */
++
++static inline Tcl_Obj *
++L_deepPtrNew(
++    int flags,
++    Tcl_Obj *objPtr,
++    Tcl_Obj *idxObj,
++    Tcl_Obj **elemPtrPtr)
++{
++    Tcl_Obj *deepPtrObj = Tcl_NewObj();
++    L_DeepPtr *deepPtr;
++
++    if (flags & (L_DELETE | L_IDX_STRING)) {
++	deepPtr = (L_DeepPtr *)Tcl_Alloc(sizeof(L_DeepPtr));
++
++	deepPtr->parentObj = objPtr;
++	Tcl_IncrRefCount(objPtr);
++
++	deepPtr->idxObj = idxObj;
++	Tcl_IncrRefCount(idxObj);
++
++	deepPtr->flags = flags;
++
++	deepPtrObj->typePtr = &L_deepPtr2Type;
++	deepPtrObj->internalRep.twoPtrValue.ptr1 = deepPtr;
++    } else {
++	ASSERT(flags & (L_IDX_ARRAY | L_IDX_HASH));
++	deepPtr = (L_DeepPtr *)&deepPtrObj->internalRep.twoPtrValue;
++
++	deepPtrObj->typePtr = &L_deepPtr1Type;
++    }
++
++    deepPtr->elemPtrPtr = elemPtrPtr;
++    Tcl_IncrRefCount(*elemPtrPtr);
++
++    deepPtr->topLevObj = objPtr;
++    Tcl_IncrRefCount(objPtr);
++
++    return deepPtrObj;
++}
++
++/*
++ * Re-use the given deepPtr object.  Note that once the compiler needs a large
++ * one, it never goes back to asking for a small one.
++ */
++
++static inline void
++L_deepPtrSet(
++    Tcl_Obj *deepPtrObj,
++    int flags,
++    Tcl_Obj *objPtr,
++    Tcl_Obj *idxObj,
++    Tcl_Obj **elemPtrPtr)
++{
++    L_DeepPtr *deepPtr = L_deepPtrGet(deepPtrObj);
++
++    /* Assert !(flags & (L_DELETE|L_IDX_STRING)) => already L_deepPtr1Type. */
++    ASSERT((flags & (L_DELETE|L_IDX_STRING)) ||
++	   (deepPtrObj->typePtr == &L_deepPtr1Type));
++
++    if (flags & (L_DELETE | L_IDX_STRING)) {
++	if (deepPtrObj->typePtr == &L_deepPtr1Type) {
++	    /* Have L_deepPtr1Type, need L_deepPtr2Type. */
++	    L_DeepPtr *newDeepPtr = (L_DeepPtr *)Tcl_Alloc(sizeof(L_DeepPtr));
++
++	    newDeepPtr->topLevObj = deepPtr->topLevObj;
++
++	    newDeepPtr->parentObj = objPtr;
++	    Tcl_IncrRefCount(objPtr);
++
++	    newDeepPtr->idxObj = idxObj;
++	    Tcl_IncrRefCount(idxObj);
++
++	    newDeepPtr->flags = flags;
++
++	    deepPtrObj->typePtr = &L_deepPtr2Type;
++	    deepPtrObj->internalRep.twoPtrValue.ptr1 = newDeepPtr;
++	    deepPtrObj->internalRep.twoPtrValue.ptr2 = NULL;
++	    deepPtr = newDeepPtr;
++	} else {
++	    Tcl_Obj *oldParentObj = deepPtr->parentObj;
++	    Tcl_Obj *oldIdxObj = deepPtr->idxObj;
++
++	    deepPtr->parentObj = objPtr;
++	    Tcl_IncrRefCount(objPtr);
++
++	    deepPtr->idxObj = idxObj;
++	    Tcl_IncrRefCount(idxObj);
++
++	    deepPtr->flags = flags;
++
++	    Tcl_DecrRefCount(oldParentObj);
++	    Tcl_DecrRefCount(oldIdxObj);
++	}
++    }
++
++    deepPtr->elemPtrPtr = elemPtrPtr;
++    Tcl_IncrRefCount(*elemPtrPtr);
++
++    deepPtrObj->refCount = 0;
++}
++
++static inline void
++L_deepPtrFree(
++    Tcl_Obj *deepPtrObj)
++{
++    L_DeepPtr *deepPtr;
++
++    if (!deepPtrObj) {
++	return;
++    }
++    if (deepPtrObj->typePtr == &L_deepPtr1Type) {
++	deepPtr = (L_DeepPtr *)&deepPtrObj->internalRep.twoPtrValue;
++	Tcl_DecrRefCount(deepPtr->topLevObj);
++    } else {
++	deepPtr = (L_DeepPtr *)deepPtrObj->internalRep.twoPtrValue.ptr1;
++	Tcl_DecrRefCount(deepPtr->parentObj);
++	Tcl_DecrRefCount(deepPtr->idxObj);
++	Tcl_DecrRefCount(deepPtr->topLevObj);
++	Tcl_Free(deepPtr);
++    }
++    deepPtrObj->typePtr = NULL;
++    ASSERT(deepPtrObj->refCount == 1);
++    Tcl_DecrRefCount(deepPtrObj);
++}
++
++/*
++ * The following two functions save and set an object's refCount to 1 so that
++ * it can be modified, and restore it to its original value.  This facilitates
++ * the L deep-dive bytecodes where we know an object is unshared but we may
++ * have stack or deepPtr refs to it.  Experience has shown that the code is
++ * simpler if we just do this ugly hack.
++ */
++
++static inline Tcl_Size
++refCnt_save(
++    Tcl_Obj *objPtr)
++{
++    Tcl_Size old = objPtr->refCount;
++
++    objPtr->refCount = 1;
++    return old;
++}
++
++static inline void
++refCnt_restore(
++    Tcl_Obj *objPtr,
++    Tcl_Size old)
++{
++    ASSERT(objPtr->refCount == 1);
++    objPtr->refCount = old;
++}
++
++/*
++ * Duplicate part of struct Dict from tclDictObj.c; all we need is the first
++ * member.  The deep-dive execution code uses it to traverse hashes.
++ * WARNING: this may break if dicts change their internal rep!
++ */
++
++typedef struct L_Dict {
++    Tcl_HashTable table;	/* Object hash table to store mapping in. */
++} L_Dict;
++
++static Tcl_Obj **	L_deepDive(Tcl_Interp *interp, Tcl_Obj *obj,
++			    Tcl_Obj *idxObj, Expr_f flags, Tcl_Obj **strSlot);
+ 
+ /*
+  *----------------------------------------------------------------------
+  *
+  * InitByteCodeExecution --
+@@ -2843,10 +3159,35 @@ TEBCresume(
+ 	OBJ_UNDER_TOS = OBJ_AT_TOS;
+ 	OBJ_AT_TOS = tmpPtr;
+ 	TRACE("=> OK\n");
+ 	NEXT_INST_F0(1, 0);
+ 
++    case INST_ROT: {
++	/*
++	 * L: rotate the top |opnd|+1 stack elements.  For opnd > 0 the
++	 * element at depth opnd moves up to the stack top; for opnd < 0 the
++	 * stack top moves down to depth |opnd|.
++	 */
++
++	int opnd = TclGetInt1AtPtr(pc+1);
++
++	TRACE("%d => OK\n", opnd);
++	if (opnd > 0) {
++	    tmpPtr = OBJ_AT_DEPTH(opnd);
++	    memmove(&OBJ_AT_DEPTH(opnd), &OBJ_AT_DEPTH(opnd-1),
++		    opnd * sizeof(Tcl_Obj *));
++	    OBJ_AT_TOS = tmpPtr;
++	} else if (opnd < 0) {
++	    opnd = -opnd;
++	    tmpPtr = OBJ_AT_TOS;
++	    memmove(&OBJ_AT_DEPTH(opnd-1), &OBJ_AT_DEPTH(opnd),
++		    opnd * sizeof(Tcl_Obj *));
++	    OBJ_AT_DEPTH(opnd) = tmpPtr;
++	}
++	NEXT_INST_F0(2, 0);
++    }
++
+     case INST_STR_CONCAT1:
+ 	numArgs = TclGetUInt1AtPtr(pc + 1);
+ 	TRACE("%u => ", (unsigned)numArgs);
+ 	DECACHE_STACK_INFO();
+ 	objResultPtr = TclStringCat(interp, numArgs, &OBJ_AT_DEPTH(numArgs - 1),
+@@ -2908,10 +3249,39 @@ TEBCresume(
+ 	starting = 1;
+ #endif
+ 	TRACE("=> drop %" SIZEd " items\n", objc);
+ 	NEXT_INST_V(1, objc, 0);
+ 
++    case INST_EXPAND_ROT: {
++	/*
++	 * L: rotate the top opnd stack elements down to just above the
++	 * innermost expansion marker (see INST_EXPAND_START).
++	 */
++
++	Tcl_Size opnd = TclGetUInt1AtPtr(pc+1);	/* signed for OBJ_AT_DEPTH */
++	Tcl_Size depth;
++	Tcl_Obj **save;
++
++	if (auxObjList == NULL) {
++	    Tcl_SetObjResult(interp, Tcl_NewStringObj(
++		    "expandRot: no expansion in progress", TCL_INDEX_NONE));
++	    TRACE("%" SIZEd " => ERROR: aux stack empty\n", opnd);
++	    goto gotError;
++	}
++	depth = CURR_DEPTH - PTR2INT(auxObjList->internalRep.twoPtrValue.ptr2);
++	TRACE("%" SIZEd " %" SIZEd " => OK\n", opnd, depth);
++	if (opnd > 0 && depth > opnd) {
++	    save = (Tcl_Obj **)Tcl_Alloc(opnd * sizeof(Tcl_Obj *));
++	    memcpy(save, &OBJ_AT_DEPTH(opnd-1), opnd * sizeof(Tcl_Obj *));
++	    memmove(&OBJ_AT_DEPTH(depth-opnd-1), &OBJ_AT_DEPTH(depth-1),
++		    (depth-opnd) * sizeof(Tcl_Obj *));
++	    memcpy(&OBJ_AT_DEPTH(depth-1), save, opnd * sizeof(Tcl_Obj *));
++	    Tcl_Free(save);
++	}
++	NEXT_INST_F0(2, 0);
++    }
++
+     case INST_EXPAND_STKTOP:
+ 	/*
+ 	 * Make sure that the element at stackTop is a list; if not, just
+ 	 * leave with an error. Note that the element from the expand list
+ 	 * will be removed at checkForCatch.
+@@ -5015,11 +5385,13 @@ TEBCresume(
+ 	TRACE_APPEND_OBJ(objResultPtr);
+ 	NEXT_INST_V(5, numArgs, 1);
+ 
+     case INST_LIST_LENGTH:
+ 	TRACE("\"%.30s\" => ", O2S(OBJ_AT_TOS));
+-	if (TclListObjLength(interp, OBJ_AT_TOS, &length) != TCL_OK) {
++	if (OBJ_AT_TOS->undef) {
++	    length = 0;			/* L undef has no elements */
++	} else if (TclListObjLength(interp, OBJ_AT_TOS, &length) != TCL_OK) {
+ 	    TRACE_ERROR(interp);
+ 	    goto gotError;
+ 	}
+ 	TclNewIntObj(objResultPtr, length);
+ 	TRACE_APPEND_NUM_OBJ(objResultPtr);
+@@ -5581,11 +5953,31 @@ TEBCresume(
+ 	value2Ptr = OBJ_AT_TOS;
+ 	valuePtr = OBJ_UNDER_TOS;
+ 	TRACE("\"%.20s\" \"%.20s\" => ", O2S(valuePtr), O2S(value2Ptr));
+ 
+     stringCompare:;		// Semicolon *required* by Clang
+-	{
++	if (valuePtr->undef ^ value2Ptr->undef) {
++	    /*
++	     * L undef never equals anything that's defined, and all ordering
++	     * comparisons with it are false.
++	     */
++
++	    switch (*pc) {
++	    case INST_GT:
++	    case INST_GE:
++	    case INST_STR_GT:
++	    case INST_STR_GE:
++		match = -1;
++		break;
++	    case INST_STR_CMP:
++		match = 0;
++		break;
++	    default:
++		match = 1;
++		break;
++	    }
++	} else {
+ 	    int checkEq = ((*pc == INST_EQ) || (*pc == INST_NEQ)
+ 		    || (*pc == INST_STR_EQ) || (*pc == INST_STR_NEQ));
+ 	    match = TclStringCmp(valuePtr, value2Ptr, checkEq, 0, -1);
+ 	}
+ 
+@@ -5631,11 +6023,11 @@ TEBCresume(
+ 	JUMP_PEEPHOLE_F(match, 1, 2);
+ 
+     case INST_STR_LEN:
+ 	valuePtr = OBJ_AT_TOS;
+ 	TRACE("\"%.30s\" => ", O2S(valuePtr));
+-	slength = Tcl_GetCharLength(valuePtr);
++	slength = valuePtr->undef ? 0 : Tcl_GetCharLength(valuePtr);
+ 	TclNewIntObj(objResultPtr, slength);
+ 	TRACE_APPEND_NUM_OBJ(objResultPtr);
+ 	NEXT_INST_F(1, 1, 1);
+ 
+     {
+@@ -5929,11 +6321,14 @@ TEBCresume(
+ 	/*
+ 	 * Check that at least one of the objects is Unicode before promoting
+ 	 * both.
+ 	 */
+ 
+-	if (TclHasInternalRep(valuePtr, &tclStringType)
++	if (valuePtr->undef ^ value2Ptr->undef) {
++	    /* L undef never equals anything that's defined. */
++	    match = 0;
++	} else if (TclHasInternalRep(valuePtr, &tclStringType)
+ 		|| TclHasInternalRep(value2Ptr, &tclStringType)) {
+ 	    Tcl_UniChar *ustring1 = Tcl_GetUnicodeFromObj(valuePtr, &slength);
+ 	    Tcl_UniChar *ustring2 = Tcl_GetUnicodeFromObj(value2Ptr, &length2);
+ 	    match = TclUniCharMatch(ustring1, slength, ustring2, length2,
+ 		    nocase);
+@@ -6029,11 +6424,16 @@ TEBCresume(
+ 	if (regExpr == NULL) {
+ 	    CACHE_STACK_INFO();
+ 	    TRACE_ERROR(interp);
+ 	    goto gotError;
+ 	}
+-	match = Tcl_RegExpExecObj(interp, regExpr, valuePtr, 0, 0, 0);
++	if (valuePtr->undef ^ value2Ptr->undef) {
++	    /* L undef never matches anything that's defined. */
++	    match = 0;
++	} else {
++	    match = Tcl_RegExpExecObj(interp, regExpr, valuePtr, 0, 0, 0);
++	}
+ 	CACHE_STACK_INFO();
+ 	if (match < 0) {
+ 	    TRACE_ERROR(interp);
+ 	    goto gotError;
+ 	}
+@@ -6046,11 +6446,15 @@ TEBCresume(
+ 	TRACE_APPEND("%d\n", match);
+ 	JUMP_PEEPHOLE_F(match, 2, 2);
+     }
+     }
+     case INST_IS_EMPTY: {
+-	int empty = Tcl_IsEmpty(OBJ_AT_TOS);
++	/*
++	 * The L undef value is not equal to anything defined, including the
++	 * empty string ("$x == {}" is optimized to this instruction).
++	 */
++	int empty = !OBJ_AT_TOS->undef && Tcl_IsEmpty(OBJ_AT_TOS);
+ 	TRACE("\"%.30s\" => %d", O2S(OBJ_AT_TOS), empty);
+ 	JUMP_PEEPHOLE_F(empty, 1, 1);
+     }
+ 
+     /*
+@@ -6083,10 +6487,16 @@ TEBCresume(
+ 
+ 	value2Ptr = OBJ_AT_TOS;
+ 	valuePtr = OBJ_UNDER_TOS;
+ 	TRACE("\"%.20s\" \"%.20s\" => ", O2S(valuePtr), O2S(value2Ptr));
+ 
++	/* L undef never equals anything that's defined. */
++	if (valuePtr->undef ^ value2Ptr->undef) {
++	    iResult = (*pc == INST_NEQ);
++	    goto foundResult;
++	}
++
+ 	/*
+ 	 * Try to determine, without triggering generation of a string
+ 	 * representation, whether one value is not a number.
+ 	 */
+ 	if (TclCheckEmptyString(valuePtr) > 0 || TclCheckEmptyString(value2Ptr) > 0) {
+@@ -7805,10 +8215,849 @@ TEBCresume(
+ 	TclNewIntObj(objResultPtr, wval);
+ 	TRACE_APPEND_NUM_OBJ(objResultPtr);
+ 	NEXT_INST_F(2, 0, 1);
+     }
+ 
++    /*
++     * -----------------------------------------------------------------
++     *	   Start of opcodes for the L language.
++     */
++
++    case INST_L_FOREACH_START: {
++	/*
++	 * L: initialize an L array foreach loop (the Tcl 8.5 style foreach
++	 * that keeps the value lists and the iteration counter in local temp
++	 * variables, leaving nothing on the stack during the loop body). Set
++	 * the iteration counter temp to -1.
++	 */
++
++	ForeachInfo *infoPtr;
++	Var *iterVarPtr;
++
++	tblIdx = TclGetUInt4AtPtr(pc+1);
++	infoPtr = (ForeachInfo *)codePtr->auxDataArrayPtr[tblIdx].clientData;
++	iterVarPtr = LOCAL(infoPtr->loopCtTemp);
++	TRACE("%u => loop iter count temp %" SIZEd "\n", tblIdx,
++		(Tcl_Size) infoPtr->loopCtTemp);
++	if (iterVarPtr->value.objPtr) {
++	    TclDecrRefCount(iterVarPtr->value.objPtr);
++	}
++	TclNewIntObj(iterVarPtr->value.objPtr, -1);
++	Tcl_IncrRefCount(iterVarPtr->value.objPtr);
++	NEXT_INST_F0(5, 0);
++    }
++
++    case INST_L_FOREACH_STEP: {
++	/*
++	 * L: "step" an L array foreach loop (i.e., begin its next iteration)
++	 * by assigning the next value list element to each loop var. Loop
++	 * vars for which a value list has run out of elements are set to
++	 * the L undef value.  Pushes whether to continue the loop.
++	 */
++
++	ForeachInfo *infoPtr;
++	ForeachVarList *varListPtr;
++	Var *iterVarPtr;
++	Tcl_Obj *listPtr, **elements;
++	Tcl_Size i, j, iterNum, listLen, numVars, valIndex, listTmpIndex;
++	Tcl_Size numLists;
++	int continueLoop = 0;
++
++	tblIdx = TclGetUInt4AtPtr(pc+1);
++	infoPtr = (ForeachInfo *)codePtr->auxDataArrayPtr[tblIdx].clientData;
++	numLists = infoPtr->numLists;
++	TRACE("%u => ", tblIdx);
++
++	/*
++	 * Increment the temp holding the loop iteration number.
++	 */
++
++	iterVarPtr = LOCAL(infoPtr->loopCtTemp);
++	valuePtr = iterVarPtr->value.objPtr;
++	iterNum = valuePtr->internalRep.wideValue + 1;
++	if (Tcl_IsShared(valuePtr)) {
++	    TclDecrRefCount(valuePtr);
++	    TclNewIntObj(valuePtr, iterNum);
++	    Tcl_IncrRefCount(valuePtr);
++	    iterVarPtr->value.objPtr = valuePtr;
++	} else {
++	    TclSetIntObj(valuePtr, iterNum);
++	}
++
++	/*
++	 * Check whether all value lists are exhausted and we should stop the
++	 * loop.
++	 */
++
++	listTmpIndex = infoPtr->firstValueTemp;
++	for (i = 0;  i < numLists;  i++) {
++	    numVars = infoPtr->varLists[i]->numVars;
++	    listPtr = LOCAL(listTmpIndex)->value.objPtr;
++	    if (TclListObjLength(interp, listPtr, &listLen) != TCL_OK) {
++		TRACE_ERROR(interp);
++		goto gotError;
++	    }
++	    if (listLen > iterNum * numVars) {
++		continueLoop = 1;
++	    }
++	    listTmpIndex++;
++	}
++
++	/*
++	 * If some var in some var list still has a remaining list element
++	 * iterate one more time. Assign to var the next element from its
++	 * value list. We already checked above that each list temp holds a
++	 * valid list object (by calling Tcl_ListObjLength), but cannot rely
++	 * on that check remaining valid: one list could have been shimmered
++	 * as a side effect of setting a traced variable.
++	 */
++
++	if (continueLoop) {
++	    listTmpIndex = infoPtr->firstValueTemp;
++	    for (i = 0;  i < numLists;  i++) {
++		varListPtr = infoPtr->varLists[i];
++		numVars = varListPtr->numVars;
++
++		listPtr = TclListObjCopy(NULL,
++			LOCAL(listTmpIndex)->value.objPtr);
++		TclListObjGetElements(interp, listPtr, &listLen, &elements);
++
++		valIndex = (iterNum * numVars);
++		for (j = 0;  j < numVars;  j++) {
++		    Tcl_LVTIndex varIndex = varListPtr->varIndexes[j];
++
++		    if (valIndex >= listLen) {
++			TclNewObj(valuePtr);
++			valuePtr->undef = 1;
++		    } else {
++			valuePtr = elements[valIndex];
++		    }
++
++		    varPtr = LOCALVAR(varIndex);
++		    if (TclIsVarDirectWritable(varPtr)) {
++			value2Ptr = varPtr->value.objPtr;
++			if (valuePtr != value2Ptr) {
++			    if (value2Ptr != NULL) {
++				TclDecrRefCount(value2Ptr);
++			    }
++			    varPtr->value.objPtr = valuePtr;
++			    Tcl_IncrRefCount(valuePtr);
++			}
++		    } else {
++			DECACHE_STACK_INFO();
++			if (TclPtrSetVarIdx(interp, varPtr, NULL, NULL, NULL,
++				valuePtr, TCL_LEAVE_ERR_MSG, varIndex)==NULL){
++			    CACHE_STACK_INFO();
++			    TRACE_ERROR(interp);
++			    TclDecrRefCount(listPtr);
++			    goto gotError;
++			}
++			CACHE_STACK_INFO();
++		    }
++		    valIndex++;
++		}
++		TclDecrRefCount(listPtr);
++		listTmpIndex++;
++	    }
++	}
++	TRACE_APPEND("%" SIZEd " lists, iter %" SIZEd ", %s loop\n",
++		numLists, iterNum, (continueLoop? "continue" : "exit"));
++	objResultPtr = TCONST(continueLoop);
++	NEXT_INST_F(5, 0, 1);
++    }
++
++    case INST_L_INDEX: {
++	/*
++	 * Index into an L array, hash, struct, or string, and return either
++	 * the indexed value or an L "deep pointer".  On entry, the stack is
++	 * (the stack top is on the right):
++	 *
++	 *   <obj | deep-ptr> <idx>
++	 *
++	 * <obj> is the object being indexed in to.  An L deep pointer
++	 * <deep-ptr> from a previous instance of this instruction also can be
++	 * used; this is how multiple levels are indexed.
++	 *
++	 * On exit, the stack configuration depends on what flags are in
++	 * the instruction:
++	 *
++	 *   <elem-val>               if flags & L_PUSH_VAL
++	 *   <deep-ptr>               if flags & L_PUSH_PTR
++	 *   <elem-val> <deep-ptr>    if flags & L_PUSH_VALPTR
++	 *   <deep-ptr> <elem-val>    if flags & L_PUSH_PTRVAL
++	 *   (nothing)                if flags & L_DISCARD
++	 *
++	 * where <elem-val> is the object in <obj> referenced by the given
++	 * index and <deep-ptr> is an object of L_deepPtrType type that only
++	 * this code and the INST_L_DEEP_WRITE bytecode know about.  It is
++	 * basically a pointer to <elem-val> that can be used to index or
++	 * modify the element in-place later.
++	 *
++	 * If flags & L_LVALUE, it is assumed that the element is going to be
++	 * written later by INST_L_DEEP_WRITE, so if any part of the path to
++	 * that element is shared, an unshared copy is made.  If this results
++	 * in the top-level object itself getting copied, the new obj gets
++	 * written back into the local variable when the INST_L_DEEP_WRITE is
++	 * done later.  This is possible since the <deep-ptr> encapsulates a
++	 * back-pointer to the top-level object.
++	 */
++
++	Tcl_Obj **elemPtrPtr;
++	Tcl_Obj *idxObj, *deepPtrObj = NULL, *strElemObj = NULL;
++	L_DeepPtr *deepPtr = NULL;
++	int dropRefCnt = 0;
++	unsigned int flags = TclGetUInt4AtPtr(pc+1);
++	int lvalue = (flags & L_LVALUE);
++	int needPtr = (flags & (L_PUSH_PTR | L_PUSH_PTRVAL | L_PUSH_VALPTR));
++
++	/* needPtr => L_PUSH_VAL not set */
++	ASSERT(!needPtr || !(flags & L_PUSH_VAL));
++
++	/*
++	 * Get the bytecode arguments -- the index and object being indexed in
++	 * to.  If the object is a deep pointer from an earlier instance of
++	 * this bytecode, de-reference it and get the object from inside it.
++	 */
++
++	idxObj = POP_OBJECT();
++	objPtr = POP_OBJECT();
++	TRACE("0x%x \"%.30s\" \"%.30s\" => ", flags,
++		(L_isDeepPtr(objPtr) ? "<deep-ptr>" : O2S(objPtr)),
++		O2S(idxObj));
++	if (L_isDeepPtr(objPtr)) {
++	    deepPtrObj = objPtr;
++	    deepPtr = L_deepPtrGet(deepPtrObj);
++	    objPtr = *(deepPtr->elemPtrPtr);
++
++	    /*
++	     * Enclosing obj ref + deepPtr ref == 2.  Not >2 because in
++	     * previous iterations through here we already ensured the
++	     * sub-object is an un-shared copy.
++	     */
++
++	    ASSERT(!lvalue || (objPtr->refCount == 2));
++	    ASSERT(!Tcl_IsShared(deepPtrObj));
++	}
++
++	/*
++	 * Drop the stack ref to the object being indexed.  We have to do this
++	 * now, because we might need to modify the object (e.g., to extend an
++	 * array) and list operations on shared objects will fail.  But if the
++	 * stack ref is the only ref (which happens when you index a constant
++	 * or a function's return value), we have to delay it or else the
++	 * object will get deleted.  A little ugly, but there's no way around
++	 * this.
++	 */
++
++	if (objPtr->refCount == 1) {
++	    ASSERT(deepPtrObj == NULL);
++	    dropRefCnt = 1;
++	} else {
++	    /*
++	     * This drops either the stack ref (deepPtrObj==NULL) or the
++	     * deepPtr ref (objPtr=*elemPtrPtr in that case; this is why
++	     * L_deepPtrSet() and L_deepPtrFree() do not drop the *elemPtrPtr
++	     * ref).
++	     */
++
++	    Tcl_DecrRefCount(objPtr);
++	}
++
++	/*
++	 * Special handling for l-values: ensure we have an un-shared copy.
++	 * Note that only the top-level object, i.e., the target of the first
++	 * index of a sequence of indices into a nested object, will get
++	 * copied here.  Sub-objects inside the top-level also need to be
++	 * un-shared, but L_deepDive() copies those, so by the time we get
++	 * back around here in the next iteration to index into *them*, they
++	 * won't be shared.
++	 */
++
++	if (lvalue && Tcl_IsShared(objPtr)) {
++	    ASSERT(deepPtrObj == NULL);
++	    objPtr = Tcl_DuplicateObj(objPtr);
++	    Tcl_IncrRefCount(objPtr);
++	    dropRefCnt = 1;
++	}
++
++	/*
++	 * Index into the object.
++	 */
++
++	elemPtrPtr = L_deepDive(interp, objPtr, idxObj, (Expr_f) flags,
++		&strElemObj);
++	if (!elemPtrPtr) {
++	    if (dropRefCnt) {
++		Tcl_DecrRefCount(objPtr);	/* drop stack/deepPtr ref */
++	    }
++	    Tcl_DecrRefCount(idxObj);		/* drop stack ref */
++	    TRACE_ERROR(interp);
++	    goto gotError;
++	}
++
++	/*
++	 * If flags indicate a deep-ptr is needed, make an L_deepPtrType object
++	 * that refers to the indexed element and stash the top-level object
++	 * pointer and other bookkeeping in there.  The top-level object is
++	 * needed in the INST_L_DEEP_WRITE coming later to update the variable
++	 * being written.  If a deep ptr was already on the stack, recycle it
++	 * (and note that it already points to the top-level object).
++	 */
++
++	if (needPtr) {
++	    if (deepPtrObj) {
++		L_deepPtrSet(deepPtrObj, flags, objPtr, idxObj, elemPtrPtr);
++	    } else {
++		deepPtrObj = L_deepPtrNew(flags, objPtr, idxObj, elemPtrPtr);
++	    }
++	    if (elemPtrPtr == &strElemObj) {
++		/*
++		 * A string index: the indexed character lives in a new
++		 * object that must be kept in the (L_deepPtr2Type) deep
++		 * pointer itself.
++		 */
++
++		deepPtr = L_deepPtrGet(deepPtrObj);
++		deepPtr->strElemObj = strElemObj;
++		elemPtrPtr = deepPtr->elemPtrPtr = &deepPtr->strElemObj;
++	    }
++	}
++
++	/*
++	 * Leave the value, deep-pointer, or both on the stack as requested by
++	 * the input flags.
++	 */
++
++	switch (flags &
++		(L_PUSH_VAL|L_PUSH_PTR|L_PUSH_PTRVAL|L_PUSH_VALPTR|L_DISCARD)) {
++	case L_PUSH_VAL:
++	    PUSH_OBJECT(*elemPtrPtr);
++	    L_deepPtrFree(deepPtrObj);
++	    TRACE_APPEND_OBJ(OBJ_AT_TOS);
++	    break;
++	case L_PUSH_PTR:
++	    PUSH_OBJECT(deepPtrObj);
++	    TRACE_APPEND("<deep-ptr>\n");
++	    break;
++	case L_PUSH_PTRVAL:
++	    PUSH_OBJECT(deepPtrObj);
++	    PUSH_OBJECT(*elemPtrPtr);
++	    TRACE_APPEND("<deep-ptr> \"%.30s\"\n", O2S(OBJ_AT_TOS));
++	    break;
++	case L_PUSH_VALPTR:
++	    PUSH_OBJECT(*elemPtrPtr);
++	    PUSH_OBJECT(deepPtrObj);
++	    TRACE_APPEND("\"%.30s\" <deep-ptr>\n", O2S(OBJ_UNDER_TOS));
++	    break;
++	case L_DISCARD:
++	    L_deepPtrFree(deepPtrObj);
++	    TRACE_APPEND("discarded\n");
++	    break;
++	default:
++	    Tcl_Panic("illegal operand to INST_L_INDEX");
++	    break;
++	}
++
++	/* Drop the stack refs. */
++	if (dropRefCnt) {
++	    Tcl_DecrRefCount(objPtr);
++	}
++	Tcl_DecrRefCount(idxObj);
++	if (strElemObj) {
++	    Tcl_BounceRefCount(strElemObj);	/* free it if unused */
++	}
++
++	NEXT_INST_F0(5, 0);
++    }
++
++    case INST_L_DEEP_WRITE: {
++	/*
++	 * Write to, or delete, an element of a hash/array/struct/string and
++	 * store the top-level hash/array/struct/string object in a local.
++	 * Leave on the stack the old element value, the new element value, or
++	 * nothing, as requested.
++	 *
++	 * Stack on entry (the stack top is on the right):
++	 *
++	 *   [<rval>] <l-deep-ptr> [<arrayIdx>]
++	 *
++	 * <l-deep-ptr>		L deep pointer that is created only by
++	 *			INST_L_INDEX (above).  This "points" to what
++	 *			we're indexing in to or deleting.
++	 * <rval>		Object to assign to the object pointed
++	 *			to by <l-deep-ptr>.  Not present for L_DELETE.
++	 * <arrayIdx>		Array index.  Present only for L_INSERT_ELT
++	 *			and L_INSERT_LIST.  An index of -1 means
++	 *			append.
++	 *
++	 * Instruction arguments:
++	 *
++	 * opnd1 (four bytes): A local index.  The top-level
++	 *    array/hash/struct/string object that is encapsulated in the
++	 *    <l-deep-ptr> is stored in this local.
++	 *
++	 * opnd2 (four bytes): flags, as follows:
++	 *
++	 *     L_IDX_STRING, L_IDX_ARRAY, L_IDX_HASH, L_INSERT_ELT,
++	 *     L_INSERT_LIST, L_DELETE
++	 *     Indicates what kind of object we're indexing in to and whether
++	 *     we're writing a single element, deleting an element, or
++	 *     inserting an element or another list into a list (array).
++	 *     Mutually exclusive.
++	 *
++	 *     L_PUSH_NEW, L_PUSH_OLD, L_DISCARD
++	 *     Whether to leave the new value, old value, or nothing on the
++	 *     stack. Mutually exclusive.
++	 */
++
++	int arrayIdx = 0, ret;
++	Tcl_Size save;
++	Tcl_Obj *arrayIdxObj, *deepPtrObj, *oldvalObj, *rvalObj = NULL;
++	Tcl_Obj *currTopLevObj, *newTopLevObj;
++	L_DeepPtr *deepPtr;
++	unsigned int flags, idx;
++
++	idx = TclGetUInt4AtPtr(pc+1);
++	flags = TclGetUInt4AtPtr(pc+5);
++	TRACE("%u 0x%x => ", idx, flags);
++
++	/* assert flags & L_DELETE => !(flags & L_PUSH_NEW) */
++	ASSERT(!(flags & L_DELETE) || !(flags & L_PUSH_NEW));
++
++	/* Pop the array index, if present. */
++	if (flags & (L_INSERT_ELT | L_INSERT_LIST)) {
++	    arrayIdxObj = POP_OBJECT();
++	    if (TclGetIntFromObj(NULL, arrayIdxObj, &arrayIdx) != TCL_OK) {
++		Tcl_DecrRefCount(arrayIdxObj);
++		Tcl_SetObjResult(interp, Tcl_NewStringObj(
++			"cannot convert index to integer", TCL_INDEX_NONE));
++		TRACE_ERROR(interp);
++		goto gotError;
++	    }
++	    Tcl_DecrRefCount(arrayIdxObj);
++	}
++	/* Pop the other instruction arguments. */
++	deepPtrObj = POP_OBJECT();
++	if (!(flags & L_DELETE)) {
++	    rvalObj = POP_OBJECT();
++	}
++	deepPtr = L_deepPtrGet(deepPtrObj);
++	ASSERT(!Tcl_IsShared(deepPtrObj));
++	if (deepPtrObj->typePtr == &L_deepPtr2Type) {
++	    flags |= deepPtr->flags;
++	}
++
++	/*
++	 * currTopLevObj is what the local currently points to.  If it was
++	 * shared, newTopLevObj got an unshared copy (made by INST_L_INDEX).
++	 * We will write into the unshared copy in-place and set the var to it
++	 * below.
++	 */
++
++	varPtr = LOCALVAR(idx);
++	currTopLevObj = varPtr->value.objPtr;
++	newTopLevObj = deepPtr->topLevObj;
++
++	/*
++	 * Write or append the new value to the indexed element, or delete the
++	 * indexed element, as requested.
++	 */
++
++	oldvalObj = *(deepPtr->elemPtrPtr);
++	switch (flags & (L_IDX_STRING|L_INSERT_ELT|L_INSERT_LIST|L_DELETE)) {
++	case L_IDX_STRING:
++	case L_IDX_STRING | L_DELETE: {
++	    Tcl_Size len;
++	    int strIdx;
++	    Tcl_Obj *newStr;
++	    Tcl_Obj *target = deepPtr->parentObj;
++
++	    /* Check for writing to index beyond string's end. */
++	    TclGetIntFromObj(NULL, deepPtr->idxObj, &strIdx);
++	    len = Tcl_GetCharLength(target);
++	    if (strIdx > len) {
++		Tcl_SetObjResult(interp, Tcl_NewStringObj(
++			"index is more than one past end of string",
++			TCL_INDEX_NONE));
++		if (rvalObj) {
++		    Tcl_DecrRefCount(rvalObj);
++		}
++		Tcl_DecrRefCount(oldvalObj);
++		L_deepPtrFree(deepPtrObj);
++		TRACE_ERROR(interp);
++		goto gotError;
++	    }
++	    /*
++	     * Copy to newStr chars up to but skipping the given index. (Note
++	     * that Tcl_GetRange() takes a negative last index to mean the
++	     * end of the string.)
++	     */
++
++	    if (strIdx > 0) {
++		newStr = Tcl_GetRange(target, 0, strIdx-1);
++	    } else {
++		TclNewObj(newStr);
++	    }
++	    Tcl_IncrRefCount(newStr);
++	    if (Tcl_IsShared(newStr)) {
++		Tcl_DecrRefCount(newStr);
++		newStr = Tcl_DuplicateObj(newStr);
++		Tcl_IncrRefCount(newStr);
++	    }
++	    if (!(flags & L_DELETE)) {
++		/* Append the rval obj. */
++		Tcl_AppendObjToObj(newStr, rvalObj);
++	    }
++	    /* Append to newStr all chars after the given index. */
++	    if (strIdx < len) {
++		Tcl_Obj *r = Tcl_GetRange(target, strIdx+1, len-1);
++
++		Tcl_IncrRefCount(r);
++		Tcl_AppendObjToObj(newStr, r);
++		Tcl_DecrRefCount(r);
++	    }
++
++	    /*
++	     * Assign newStr to target.  Possible target ref counts:
++	     * If a one-level index like s[2] = "x" and s unshared:
++	     *   deepPtr->topLevObj + deepPtr->parentObj + var ref (s)
++	     * If a one-level index like s[2] = "x" and s was shared:
++	     *   deepPtr->topLevObj + deepPtr->parentObj
++	     * (because INST_L_INDEX dup'd but s isn't pointing to it yet)
++	     * Note that a multi-level index like s[0][2] = "x" is
++	     * disallowed by the compiler.
++	     */
++
++	    ASSERT((target->refCount == 2) || (target->refCount == 3));
++	    save = refCnt_save(target);
++	    TclSetDuplicateObj(target, newStr);
++	    refCnt_restore(target, save);
++	    Tcl_DecrRefCount(newStr);
++	    break;
++	}
++	case L_INSERT_ELT:
++	case L_INSERT_LIST: {
++	    Tcl_Size elc;
++	    Tcl_Obj **elv;
++	    Tcl_Size first = (arrayIdx == -1) ? TCL_SIZE_MAX : arrayIdx;
++
++	    /*
++	     * oldvalObj has a stack ref and a deepPtr ref, so drop one so we
++	     * can append to it (it must be unshared), then restore it (since
++	     * it's dropped later by L_deepPtrFree()).
++	     */
++
++	    ASSERT(oldvalObj->refCount == 2);
++	    ASSERT(rvalObj);
++	    Tcl_DecrRefCount(oldvalObj);
++	    if (flags & L_INSERT_ELT) {
++		ret = Tcl_ListObjReplace(interp, oldvalObj, first, 0,
++			1, &rvalObj);
++	    } else {
++		ret = TclListObjGetElements(interp, rvalObj, &elc, &elv);
++		if (ret == TCL_OK) {
++		    ret = Tcl_ListObjReplace(interp, oldvalObj, first, 0,
++			    elc, elv);
++		}
++	    }
++	    Tcl_IncrRefCount(oldvalObj);
++	    Tcl_IncrRefCount(oldvalObj);
++	    (void) ret;
++	    break;
++	}
++	case L_DELETE:
++	    save = refCnt_save(deepPtr->parentObj);
++	    if (deepPtr->flags & L_IDX_HASH) {
++		ret = Tcl_DictObjRemove(interp, deepPtr->parentObj,
++			deepPtr->idxObj);
++	    } else if (deepPtr->flags & L_IDX_ARRAY) {
++		int i;
++
++		TclGetIntFromObj(NULL, deepPtr->idxObj, &i);
++		ret = Tcl_ListObjReplace(interp, deepPtr->parentObj,
++			i, 1, 0, NULL);
++	    } else {
++		/* Not array or hash? error! */
++		ret = TCL_ERROR;
++	    }
++	    refCnt_restore(deepPtr->parentObj, save);
++	    if (ret != TCL_OK) {
++		Tcl_Panic("err deleting element in INST_L_DEEP_WRITE");
++	    }
++	    break;
++	default:
++	    *(deepPtr->elemPtrPtr) = rvalObj;
++	    Tcl_IncrRefCount(rvalObj);		/* add parent obj ref */
++	    ASSERT(oldvalObj->refCount >= 2);
++	    Tcl_DecrRefCount(oldvalObj);	/* drop old parent obj ref */
++	    break;
++	}
++
++	/*
++	 * If the local pointed to a shared object when it was indexed, the
++	 * INST_L_INDEX code made an un-shared copy of the obj and cached it
++	 * in deepPtr.  In that case, update the local to point to the
++	 * un-shared copy.
++	 */
++
++	if (currTopLevObj != newTopLevObj) {	/* update only if needed */
++	    if (TclIsVarDirectWritable(varPtr)) {
++		varPtr->value.objPtr = newTopLevObj;
++		Tcl_IncrRefCount(newTopLevObj);		/* add new var ref */
++		if (currTopLevObj) {
++		    Tcl_DecrRefCount(currTopLevObj);	/* lose old var ref */
++		}
++	    } else {
++		DECACHE_STACK_INFO();
++		if (!TclPtrSetVarIdx(interp, varPtr, NULL, NULL, NULL,
++			newTopLevObj, TCL_LEAVE_ERR_MSG, idx)) {
++		    Tcl_Panic("could not set var in INST_L_DEEP_WRITE");
++		}
++		CACHE_STACK_INFO();
++	    }
++	}
++
++	switch (flags & (L_PUSH_OLD|L_PUSH_NEW|L_DISCARD)) {
++	case L_PUSH_OLD:
++	    PUSH_OBJECT(oldvalObj);
++	    TRACE_APPEND_OBJ(OBJ_AT_TOS);
++	    break;
++	case L_PUSH_NEW:
++	    PUSH_OBJECT(rvalObj);
++	    TRACE_APPEND_OBJ(OBJ_AT_TOS);
++	    break;
++	case L_DISCARD:
++	    TRACE_APPEND("discarded\n");
++	    break;
++	default:
++	    Tcl_Panic("Bad flags to INST_L_DEEP_WRITE");
++	    break;
++	}
++
++	Tcl_DecrRefCount(oldvalObj);		/* drop old deepPtr ref */
++	if (rvalObj) {
++	    Tcl_DecrRefCount(rvalObj);		/* drop stack ref */
++	}
++	L_deepPtrFree(deepPtrObj);
++
++	ASSERT(!Tcl_IsShared(newTopLevObj));
++	NEXT_INST_F0(9, 0);
++    }
++
++    case INST_L_SPLIT: {
++	int n;
++	Tcl_Obj *strObj = NULL, *delimObj = NULL, *limitObj = NULL;
++	unsigned int flags = TclGetUInt4AtPtr(pc+1);
++
++	if (flags & L_SPLIT_LIM) {
++	    ASSERT(flags & (L_SPLIT_RE | L_SPLIT_STR));
++	    delimObj = OBJ_AT_DEPTH(2);
++	    strObj   = OBJ_AT_DEPTH(1);
++	    limitObj = OBJ_AT_DEPTH(0);
++	    n = 3;
++	} else if (flags & (L_SPLIT_RE | L_SPLIT_STR)) {
++	    delimObj = OBJ_AT_DEPTH(1);
++	    strObj   = OBJ_AT_DEPTH(0);
++	    n = 2;
++	} else {
++	    strObj   = OBJ_AT_DEPTH(0);
++	    n = 1;
++	}
++	TRACE("0x%x \"%.30s\" => ", flags, O2S(strObj));
++	DECACHE_STACK_INFO();
++	objResultPtr = L_split(interp, strObj, delimObj, limitObj,
++		(Expr_f) flags);
++	CACHE_STACK_INFO();
++	if (!objResultPtr) {
++	    TRACE_ERROR(interp);
++	    goto gotError;
++	}
++	TRACE_APPEND_OBJ(objResultPtr);
++	NEXT_INST_V(5, n, 1);
++    }
++
++    case INST_L_DEFINED:
++	objResultPtr = TCONST(OBJ_AT_TOS->undef == 0);
++	TRACE("\"%.30s\" => ", O2S(OBJ_AT_TOS));
++	TRACE_APPEND_OBJ(objResultPtr);
++	NEXT_INST_F(1, 1, 1);
++
++    case INST_L_PUSH_LIST_SIZE:
++	valuePtr = OBJ_AT_TOS;
++	if (L_isDeepPtr(valuePtr)) {
++	    valuePtr = *L_deepPtrGet(valuePtr)->elemPtrPtr;
++	}
++	TRACE("\"%.20s\" => ", O2S(valuePtr));
++	if (TclListObjLength(interp, valuePtr, &length) != TCL_OK) {
++	    TRACE_ERROR(interp);
++	    goto gotError;
++	}
++	L_sizes_push(length - 1);
++	TRACE_APPEND("%" SIZEd " on L sizes stack\n", length);
++	NEXT_INST_F0(1, 0);
++
++    case INST_L_PUSH_STR_SIZE:
++	valuePtr = OBJ_AT_TOS;
++	if (L_isDeepPtr(valuePtr)) {
++	    valuePtr = *L_deepPtrGet(valuePtr)->elemPtrPtr;
++	}
++	TRACE("\"%.20s\" => ", O2S(valuePtr));
++	length = Tcl_GetCharLength(valuePtr);
++	L_sizes_push(length - 1);
++	TRACE_APPEND("%" SIZEd " on L sizes stack\n", length);
++	NEXT_INST_F0(1, 0);
++
++    case INST_L_READ_SIZE:
++	length = L_sizes_top();
++	TclNewIntObj(objResultPtr, length);
++	TRACE("=> %" SIZEd "\n", length);
++	NEXT_INST_F(1, 0, 1);
++
++    case INST_L_POP_SIZE:
++	L_sizes_pop();
++	TRACE("=> OK\n");
++	NEXT_INST_F0(1, 0);
++
++    case INST_L_PUSH_UNDEF:
++	objResultPtr = *L_undefObjPtrPtr();
++	TRACE("=> undef\n");
++	NEXT_INST_F(1, 0, 1);
++
++    case INST_L_LINDEX_STK: {
++	Tcl_Size listc;
++	Tcl_Obj **listv;
++	unsigned int i = TclGetUInt1AtPtr(pc+1);
++
++	TRACE("%u \"%.30s\" => ", i, O2S(OBJ_AT_TOS));
++	if (TclListObjGetElements(interp, OBJ_AT_TOS, &listc,
++		&listv) != TCL_OK) {
++	    TRACE_ERROR(interp);
++	    goto gotError;
++	}
++	if (i < (size_t) listc) {
++	    objResultPtr = listv[i];
++	} else {
++	    objResultPtr = *L_undefObjPtrPtr();
++	}
++	TRACE_APPEND_OBJ(objResultPtr);
++	NEXT_INST_F(2, 0, 1);
++    }
++
++    case INST_L_LIST_INSERT: {
++	int index;
++	Tcl_Size elc;
++	Tcl_Obj **elv, *listPtr, *indexPtr, *elemPtr;
++	unsigned int idx = TclGetUInt4AtPtr(pc+1);
++	unsigned int flags = TclGetUInt4AtPtr(pc+5);
++
++	indexPtr = OBJ_AT_TOS;
++	elemPtr = OBJ_UNDER_TOS;
++	TRACE("%u 0x%x \"%.30s\" \"%.30s\" => ", idx, flags, O2S(elemPtr),
++		O2S(indexPtr));
++	if (TclGetIntFromObj(NULL, indexPtr, &index) != TCL_OK) {
++	    Tcl_SetObjResult(interp, Tcl_NewStringObj(
++		    "cannot convert index to integer", TCL_INDEX_NONE));
++	    TRACE_ERROR(interp);
++	    goto gotError;
++	}
++	varPtr = LOCALVAR(idx);
++	listPtr = varPtr->value.objPtr;
++	if ((listPtr == NULL) || Tcl_IsShared(listPtr)) {
++	    listPtr = listPtr ? Tcl_DuplicateObj(listPtr) : Tcl_NewObj();
++	    DECACHE_STACK_INFO();
++	    if (!TclPtrSetVarIdx(interp, varPtr, NULL, NULL, NULL, listPtr,
++		    TCL_LEAVE_ERR_MSG, idx)) {
++		CACHE_STACK_INFO();
++		TRACE_ERROR(interp);
++		goto gotError;
++	    }
++	    CACHE_STACK_INFO();
++	}
++	if (flags & L_INSERT_ELT) {
++	    elc = 1;
++	    elv = &elemPtr;
++	} else {
++	    ASSERT(flags & L_INSERT_LIST);
++	    if (TclListObjGetElements(interp, elemPtr, &elc, &elv) != TCL_OK) {
++		TRACE_ERROR(interp);
++		goto gotError;
++	    }
++	}
++	if (Tcl_ListObjReplace(interp, listPtr,
++		(index == -1) ? TCL_SIZE_MAX : index,	/* -1 means append */
++		0, elc, elv) != TCL_OK) {
++	    TRACE_ERROR(interp);
++	    goto gotError;
++	}
++	TRACE_APPEND("OK\n");
++	NEXT_INST_F0(9, 2);
++    }
++
++    case INST_UNSET_LOCAL: {
++	unsigned int idx = TclGetUInt4AtPtr(pc+1);
++	Var *linkPtr;
++
++	/*
++	 * This is intended to delete L's local temp variables, which are
++	 * always scalars and never traced.
++	 */
++
++	varPtr = LOCAL(idx);
++	TRACE("%u => OK\n", idx);
++	if (TclIsVarLink(varPtr)) {
++	    linkPtr = varPtr->value.linkPtr;
++	    if (TclIsVarInHash(linkPtr)) {
++		VarHashRefCount(linkPtr)--;
++		if (TclIsVarUndefined(linkPtr)) {
++		    TclCleanupVar(linkPtr, NULL);
++		}
++	    }
++	    TclSetVarScalar(varPtr);
++	    varPtr->value.linkPtr = NULL;
++	} else if (!TclIsVarUndefined(varPtr)) {
++	    TclDecrRefCount(varPtr->value.objPtr);
++	    varPtr->value.objPtr = NULL;
++	    TclSetVarUndefined(varPtr);
++	}
++	NEXT_INST_F0(5, 0);
++    }
++
++    case INST_DIFFERENT_OBJ: {
++	unsigned int idx = TclGetUInt4AtPtr(pc+1);
++	Var *localVarPtr = LOCALVAR(idx);
++	Var *otherVarPtr;
++
++	TRACE("%u \"%.30s\" => ", idx, O2S(OBJ_AT_TOS));
++	DECACHE_STACK_INFO();
++	otherVarPtr = TclObjLookupVar(interp, OBJ_AT_TOS, NULL,
++		TCL_GLOBAL_ONLY, NULL, 0, 0, &arrayPtr);
++	CACHE_STACK_INFO();
++	if (otherVarPtr == NULL) {
++	    Tcl_SetObjResult(interp, Tcl_NewStringObj("variable not found",
++		    TCL_INDEX_NONE));
++	    TRACE_ERROR(interp);
++	    goto gotError;
++	}
++	while (TclIsVarLink(otherVarPtr)) {
++	    otherVarPtr = otherVarPtr->value.linkPtr;
++	}
++	if (!TclIsVarUndefined(localVarPtr)
++		&& !TclIsVarUndefined(otherVarPtr)) {
++	    objResultPtr = TCONST(
++		    localVarPtr->value.objPtr != otherVarPtr->value.objPtr);
++	} else {
++	    objResultPtr = TCONST(1);
++	}
++	TRACE_APPEND_OBJ(objResultPtr);
++	NEXT_INST_F(5, 1, 1);
++    }
++
++    /*
++     *	   End of opcodes for the L language.
++     * -----------------------------------------------------------------
++     */
++
+     default:
+ 	Tcl_Panic("TclNRExecuteByteCode: unrecognized opCode %u", *pc);
+     } /* end of switch on opCode */
+ 
+     /*
+@@ -10552,10 +11801,374 @@ StringForResultCode(
+     TclFormatInt(buf, result);
+     return buf;
+ }
+ #endif /* TCL_COMPILE_DEBUG */
+ 
++/*
++ *----------------------------------------------------------------------
++ *
++ * L_deepDiveArray --
++ *
++ *	Index one level into an L array or struct (represented as a Tcl list),
++ *	using L semantics.
++ *
++ * Results:
++ *	If flags & L_PUSH_VAL, the array is being indexed as an r-value.
++ *	Otherwise, it is assumed that the indexed value will be written
++ *	in-place later (i.e., used as an l-value), and this function does
++ *	the magic necessary to allow that.
++ *
++ *	For an r-value, this function returns a pointer to the indexed object
++ *	pointer (i.e., a Tcl_Obj ** pointer into the lists's internal element
++ *	array).  If the index is < 0 or beyond the last element, a pointer to
++ *	the L undef object is returned instead.
++ *
++ *	For an l-value, if the indexed element is shared, an un-shared copy is
++ *	made so that the indexed object later can be written in-place.  Also,
++ *	if the index is beyond the last element, the list is padded out with
++ *	copies of the L undef object.
++ *
++ * Side effects:
++ *	See above.  The lists's string representation also is invalidated.
++ *
++ *----------------------------------------------------------------------
++ */
++
++static Tcl_Obj **
++L_deepDiveArray(
++    Tcl_Interp *interp,
++    Tcl_Obj *obj,		/* object being indexed */
++    Tcl_Obj *idxObj,		/* index (array subscript) into obj */
++    Expr_f flags)
++{
++    Tcl_Size i, len;
++    int idx;
++    Tcl_Obj **elemPtrs, **pad;
++    Tcl_Obj *subObj;
++    int lvalue = (flags & L_LVALUE);
++
++    if (L_isUndef(idxObj)) {
++	Tcl_SetObjResult(interp, Tcl_NewStringObj(lvalue
++		? "cannot write to undefined array index"
++		: "cannot read from undefined array index", TCL_INDEX_NONE));
++	return NULL;
++    }
++    if (TclGetIntFromObj(NULL, idxObj, &idx) != TCL_OK) {
++	Tcl_SetObjResult(interp, Tcl_NewStringObj(
++		"cannot convert index to integer", TCL_INDEX_NONE));
++	return NULL;
++    }
++
++    if (!lvalue) {
++	if (TclListObjGetElements(NULL, obj, &len, &elemPtrs) != TCL_OK) {
++	    Tcl_SetObjResult(interp, Tcl_NewStringObj(
++		    "cannot convert object to list", TCL_INDEX_NONE));
++	    return NULL;
++	}
++	if ((idx < 0) || (idx >= len)) {
++	    return L_undefObjPtrPtr();
++	}
++	return &elemPtrs[idx];
++    }
++
++    /*
++     * We are going to modify the list in place through a pointer into its
++     * element array, so it must have its own (unshared) element storage.
++     */
++
++    if (TclDuplicateListRep(obj) != TCL_OK) {
++	Tcl_SetObjResult(interp, Tcl_NewStringObj(
++		"cannot convert object to list", TCL_INDEX_NONE));
++	return NULL;
++    }
++    TclListObjLength(NULL, obj, &len);
++    if (idx < 0) {
++	if (flags & L_NEG_OK) {
++	    return L_undefObjPtrPtr();
++	}
++	Tcl_SetObjResult(interp, Tcl_NewStringObj(
++		"cannot write to negative array index", TCL_INDEX_NONE));
++	return NULL;
++    } else if (idx >= len) {
++	/* Auto extend the array. */
++	Tcl_Size n = idx - len + 1;
++
++	pad = (Tcl_Obj **)Tcl_Alloc(n * sizeof(Tcl_Obj *));
++	for (i = 0; i < n; ++i) {
++	    pad[i] = *L_undefObjPtrPtr();
++	}
++	i = Tcl_ListObjReplace(interp, obj, len, 0, n, pad);
++	Tcl_Free(pad);
++	if ((i != TCL_OK) || (TclDuplicateListRep(obj) != TCL_OK)) {
++	    Tcl_SetObjResult(interp, Tcl_NewStringObj(
++		    "cannot convert object to list", TCL_INDEX_NONE));
++	    return NULL;
++	}
++    }
++    TclListObjGetElements(NULL, obj, &len, &elemPtrs);
++    if (Tcl_IsShared(elemPtrs[idx])) {
++	/*
++	 * Make an un-shared copy of the element.  Because we're going to
++	 * later modify it in place, if the element is itself a list, we also
++	 * have to give it its own internal list representation because
++	 * Tcl_DuplicateObj() does not (it shares the internal list rep
++	 * between the old and new Tcl_Objs).
++	 */
++
++	subObj = Tcl_DuplicateObj(elemPtrs[idx]);
++	if (TclHasInternalRep(subObj, &tclListType)) {
++	    TclDuplicateListRep(subObj);
++	}
++	Tcl_IncrRefCount(subObj);
++	Tcl_DecrRefCount(elemPtrs[idx]);
++	elemPtrs[idx] = subObj;
++    }
++    TclInvalidateStringRep(obj);
++    return &elemPtrs[idx];
++}
++
++/*
++ *----------------------------------------------------------------------
++ *
++ * L_deepDiveHash --
++ *
++ *	Index one level into an L hash (represented as a Tcl dict), using L
++ *	semantics.
++ *
++ * Results:
++ *	If flags & L_PUSH_VAL, the hash is being indexed as an r-value.
++ *	Otherwise, it is assumed that the indexed value will be written
++ *	in-place later (i.e., used as an l-value), and this function does
++ *	the magic necessary to allow that.
++ *
++ *	For an r-value, this function returns a pointer to the indexed object
++ *	pointer (i.e., a Tcl_Obj ** that points to the hash bucket).  If the
++ *	key does not exist, a pointer to the L undef object is returned
++ *	instead.
++ *
++ *	For an l-value, if the indexed element is shared, an un-shared copy is
++ *	made so that the indexed object later can be written in-place.  Also,
++ *	if the key does not exist, it is added to the hash with a value of
++ *	the L undef object.
++ *
++ * Side effects:
++ *	See above.  The hash's string representation also is invalidated.
++ *
++ *----------------------------------------------------------------------
++ */
++
++static Tcl_Obj **
++L_deepDiveHash(
++    Tcl_Interp *interp,
++    Tcl_Obj *obj,		/* object being indexed */
++    Tcl_Obj *idxObj,		/* index (key) into obj */
++    Expr_f flags)
++{
++    Tcl_Size tmp;
++    Tcl_Obj **elt;
++    L_Dict *dict;
++    Tcl_HashEntry *hPtr;
++    int lvalue = (flags & L_LVALUE);
++
++    ASSERT(!lvalue || !Tcl_IsShared(obj));  /* lvalue => obj is unshared */
++
++    if (Tcl_DictObjSize(NULL, obj, &tmp) != TCL_OK) {
++	/* Obj is not a dict and can't be converted to one. */
++	if (lvalue) {
++	    Tcl_SetObjResult(interp, Tcl_NewStringObj("not a hash",
++		    TCL_INDEX_NONE));
++	    return NULL;
++	}
++	return L_undefObjPtrPtr();
++    }
++
++    if (L_isUndef(idxObj)) {
++	static int undefIdxOk = -1;
++
++	if (undefIdxOk == -1) {
++	    undefIdxOk = getenv("BK_L_ALLOW_UNDEF_HASH_INDEX") != NULL;
++	}
++	if ((undefIdxOk == 1) && !lvalue) {
++	    return L_undefObjPtrPtr();
++	}
++	if (undefIdxOk != 1) {
++	    Tcl_SetObjResult(interp, Tcl_NewStringObj(lvalue
++		    ? "cannot write to undefined hash index"
++		    : "cannot read from undefined hash index",
++		    TCL_INDEX_NONE));
++	    return NULL;
++	}
++    }
++
++    dict = (L_Dict *)obj->internalRep.twoPtrValue.ptr1;
++    hPtr = Tcl_FindHashEntry(&dict->table, (char *)idxObj);
++    if (!hPtr) {
++	Tcl_Obj *objPtr;
++	int result;
++
++	if (!lvalue) {
++	    return L_undefObjPtrPtr();
++	}
++	TclNewObj(objPtr);
++	Tcl_IncrRefCount(objPtr);
++	result = Tcl_DictObjPut(interp, obj, idxObj, objPtr);
++	Tcl_DecrRefCount(objPtr);
++	if (result != TCL_OK) {
++	    return NULL;
++	}
++	dict = (L_Dict *)obj->internalRep.twoPtrValue.ptr1;
++	hPtr = Tcl_FindHashEntry(&dict->table, (char *)idxObj);
++    }
++    elt = (Tcl_Obj **)(void *)&Tcl_GetHashValue(hPtr);
++    ASSERT(elt);
++    if (lvalue && Tcl_IsShared(*elt)) {
++	Tcl_Obj *dupPtr = Tcl_DuplicateObj(*elt);
++
++	if (TclHasInternalRep(dupPtr, &tclListType)) {
++	    TclDuplicateListRep(dupPtr);
++	}
++	Tcl_DecrRefCount(*elt);
++	*elt = dupPtr;
++	Tcl_IncrRefCount(*elt);
++    }
++    if (lvalue) {
++	TclInvalidateStringRep(obj);
++    }
++    return elt;
++}
++
++/*
++ *----------------------------------------------------------------------
++ *
++ * L_deepDiveString --
++ *
++ *	Index into a string for the L INST_L_INDEX bytecode.
++ *
++ * Results:
++ *	Creates a new Tcl_Obj that contains a substring of obj.  To be
++ *	compatible with the other L_deepDive* functions, this function returns
++ *	a Tcl_Obj** by storing the Tcl_Obj* into *strSlot and returning
++ *	strSlot.  (The caller moves it into the deep pointer if needed.)
++ *
++ *	If the given index is negative, a run-time error is generated.  If
++ *	the index is beyond the end of the string, a pointer the L undefined
++ *	object pointer is returned.  If the index is undef, throw a run-time
++ *	error.
++ *
++ * Side effects:
++ *	None.
++ *
++ *----------------------------------------------------------------------
++ */
++
++static Tcl_Obj **
++L_deepDiveString(
++    Tcl_Interp *interp,
++    Tcl_Obj *obj,		/* object being indexed */
++    Tcl_Obj *idxObj,		/* index into obj */
++    Expr_f flags,
++    Tcl_Obj **strSlot)		/* where to store the new char object */
++{
++    int idx, ch;
++    Tcl_Obj *newObj;
++
++    if (L_isUndef(idxObj)) {
++	Tcl_SetObjResult(interp, Tcl_NewStringObj((flags & L_LVALUE)
++		? "cannot write to undefined string index"
++		: "cannot read from undefined string index", TCL_INDEX_NONE));
++	return NULL;
++    }
++    if (TclGetIntFromObj(NULL, idxObj, &idx) != TCL_OK) {
++	Tcl_SetObjResult(interp, Tcl_NewStringObj(
++		"cannot convert index to integer", TCL_INDEX_NONE));
++	return NULL;
++    }
++
++    if (idx < 0) {
++	Tcl_SetObjResult(interp, Tcl_NewStringObj(
++		"negative string index illegal", TCL_INDEX_NONE));
++	return NULL;
++    } else if (idx < Tcl_GetCharLength(obj)) {
++	ch = Tcl_GetUniChar(obj, idx);
++	if (TclIsPureByteArray(obj)) {
++	    unsigned char uch = (unsigned char) ch;
++
++	    newObj = Tcl_NewByteArrayObj(&uch, 1);
++	} else {
++	    char buf[TCL_UTF_MAX + 1];
++	    Tcl_Size len = Tcl_UniCharToUtf(ch, buf);
++
++	    newObj = Tcl_NewStringObj(buf, len);
++	}
++
++	*strSlot = newObj;
++	return strSlot;
++    } else {
++	return L_undefObjPtrPtr();
++    }
++}
++
++/*
++ *----------------------------------------------------------------------
++ *
++ * L_deepDive --
++ *
++ *	Index one level into an L array, hash, struct, or string, using L
++ *	semantics.
++ *
++ * Results:
++ *	If flags & L_PUSH_VAL, the object is being indexed as an r-value.
++ *	Otherwise, it is assumed that the indexed value will be written
++ *	in-place later (i.e., used as an l-value), and this function does
++ *	the magic necessary to allow that.
++ *
++ *	This function returns a pointer to the indexed object pointer (i.e., a
++ *	Tcl_Obj **) that later can be used to modify the element in-place.  If
++ *	the indexed element does not exist, a pointer to the L undef object is
++ *	returned instead.
++ *
++ *	For an l-value, if the indexed element is shared, an un-shared copy is
++ *	made so that the indexed object later can be written in-place.
++ *
++ * Side effects:
++ *	See comments for L_deepDiveArray() and L_deepDiveHash().  The
++ *	object's string representation also is invalidated.
++ *
++ *----------------------------------------------------------------------
++ */
++
++static Tcl_Obj **
++L_deepDive(
++    Tcl_Interp *interp,
++    Tcl_Obj *obj,
++    Tcl_Obj *idxObj,
++    Expr_f flags,
++    Tcl_Obj **strSlot)		/* storage for a string index result */
++{
++    Tcl_Obj **ret = NULL;
++
++    switch (flags & (L_IDX_ARRAY | L_IDX_HASH | L_IDX_STRING)) {
++    case L_IDX_ARRAY:
++	ret = L_deepDiveArray(interp, obj, idxObj, flags);
++	break;
++    case L_IDX_HASH:
++	ret = L_deepDiveHash(interp, obj, idxObj, flags);
++	break;
++    case L_IDX_STRING:
++	ret = L_deepDiveString(interp, obj, idxObj, flags, strSlot);
++	break;
++    default:
++	L_bomb("L_deepDive internal error");
++	break;
++    }
++    /* If we're going to write to obj, mark it as defined now. */
++    if (ret && (flags & L_LVALUE)) {
++	obj->undef = 0;
++    }
++    return ret;
++}
++
+ /*
+  * Local Variables:
+  * mode: c
+  * c-basic-offset: 4
+  * fill-column: 78
+diff --git i/generic/tclGet.c w/generic/tclGet.c
+index bb3f8f10a716..905fb28afd29 100644
+--- i/generic/tclGet.c
++++ w/generic/tclGet.c
+@@ -46,10 +46,11 @@ Tcl_GetInt(
+ 
+     obj.refCount = 1;
+     obj.bytes = (char *) src;
+     obj.length = strlen(src);
+     obj.typePtr = NULL;
++    obj.undef = 0;
+ 
+     code = Tcl_GetIntFromObj(interp, &obj, intPtr);
+     if (obj.refCount > 1) {
+ 	Tcl_Panic("invalid sharing of Tcl_Obj on C stack");
+     }
+@@ -90,10 +91,11 @@ Tcl_GetDouble(
+ 
+     obj.refCount = 1;
+     obj.bytes = (char *) src;
+     obj.length = strlen(src);
+     obj.typePtr = NULL;
++    obj.undef = 0;
+ 
+     code = Tcl_GetDoubleFromObj(interp, &obj, doublePtr);
+     if (obj.refCount > 1) {
+ 	Tcl_Panic("invalid sharing of Tcl_Obj on C stack");
+     }
+@@ -140,10 +142,11 @@ Tcl_GetBool(
+     }
+     obj.refCount = 1;
+     obj.bytes = (char *) src;
+     obj.length = strlen(src);
+     obj.typePtr = NULL;
++    obj.undef = 0;
+ 
+     code = TclSetBooleanFromAny(interp, &obj);
+     if (obj.refCount > 1) {
+ 	Tcl_Panic("invalid sharing of Tcl_Obj on C stack");
+     }
+diff --git i/generic/tclIO.c w/generic/tclIO.c
+index 741b01bb2473..5ca1d8336857 100644
+--- i/generic/tclIO.c
++++ w/generic/tclIO.c
+@@ -134,10 +134,17 @@ typedef struct {
+     int stderrInitialized;
+ } ThreadSpecificData;
+ 
+ static Tcl_ThreadDataKey dataKey;
+ 
++/*
++ * Whether a (lazily created) stdout channel exits the process on a broken
++ * pipe; see TclSetStdoutExitOnEpipe().
++ */
++
++static int stdoutExitOnEpipe = 0;
++
+ /*
+  * Key for looking up the channel table (a Tcl_HashTable indexed by channel
+  * name) in the interpreter's associated data table.
+  */
+ #define ASSOC_KEY "tclIO"
+@@ -818,10 +825,14 @@ Tcl_GetStdChannel(
+ 	    tsdPtr->stdoutInitialized = -1;
+ 	    tsdPtr->stdoutChannel = TclpGetDefaultStdChannel(TCL_STDOUT);
+ 	    if (tsdPtr->stdoutChannel != NULL) {
+ 		tsdPtr->stdoutInitialized = 1;
+ 		Tcl_RegisterChannel(NULL, tsdPtr->stdoutChannel);
++		if (stdoutExitOnEpipe) {
++		    SetFlag(((Channel *) tsdPtr->stdoutChannel)->state,
++			    CHANNEL_EXIT_ON_EPIPE);
++		}
+ 	    }
+ 	}
+ 	channel = tsdPtr->stdoutChannel;
+ 	break;
+     case TCL_STDERR:
+@@ -4297,10 +4308,98 @@ Tcl_WriteObj(
+ 	src = TclGetStringFromObj(objPtr, &srcLen);
+ 	return WriteChars(chanPtr, src, srcLen);
+     }
+ }
+ 
++/*
++ *---------------------------------------------------------------------------
++ *
++ * TclSetStdoutExitOnEpipe --
++ *
++ *	Make the stdout channel (once it is created, so as not to create it
++ *	prematurely) exit the process silently on a broken pipe, like
++ *	"fconfigure stdout -epipe exit" (used by tclsh for L).
++ *
++ *---------------------------------------------------------------------------
++ */
++
++void
++TclSetStdoutExitOnEpipe(void)
++{
++    ThreadSpecificData *tsdPtr = TCL_TSD_INIT(&dataKey);
++
++    stdoutExitOnEpipe = 1;
++    if ((tsdPtr->stdoutInitialized == 1) && tsdPtr->stdoutChannel) {
++	SetFlag(((Channel *) tsdPtr->stdoutChannel)->state,
++		CHANNEL_EXIT_ON_EPIPE);
++    }
++}
++
++/*
++ *---------------------------------------------------------------------------
++ *
++ * Tcl_WriteObjN --
++ *
++ *	Same as Tcl_WriteObj but takes the maximum number of bytes to write
++ *	(used by L's write()). For a binary channel (no encoding, or
++ *	iso8859-1, which is what "-translation binary" selects in Tcl 9)
++ *	numBytes counts bytes of the binary value, i.e. characters; otherwise
++ *	it counts bytes of the (UTF-8) string rep and is rounded down to a
++ *	character boundary.
++ *
++ * Results:
++ *	The number of bytes written, or TCL_INDEX_NONE on error.
++ *
++ *---------------------------------------------------------------------------
++ */
++
++Tcl_Size
++Tcl_WriteObjN(
++    Tcl_Channel chan,		/* The channel to buffer output for. */
++    Tcl_Obj *objPtr,		/* The object to write. */
++    Tcl_Size numBytes)		/* The number of bytes to write. */
++{
++    Channel *chanPtr;
++    ChannelState *statePtr;	/* State info for channel */
++    const char *src;
++    Tcl_Size srcLen = 0;
++
++    statePtr = ((Channel *) chan)->state;
++    chanPtr = statePtr->topChanPtr;
++
++    if (CheckChannelErrors(statePtr, TCL_WRITABLE) != 0) {
++	return TCL_INDEX_NONE;
++    }
++    if (numBytes < 0) {
++	numBytes = 0;
++    }
++    if ((statePtr->encoding == NULL) || !strcmp("iso8859-1",
++	    Tcl_GetEncodingName(statePtr->encoding))) {
++	Tcl_Size numChars = Tcl_GetCharLength(objPtr), result;
++	Tcl_Obj *rangePtr;
++
++	if (numBytes >= numChars) {
++	    return Tcl_WriteObj(chan, objPtr);
++	} else if (numBytes == 0) {
++	    return 0;
++	}
++	rangePtr = Tcl_GetRange(objPtr, 0, numBytes - 1);
++	Tcl_IncrRefCount(rangePtr);
++	result = Tcl_WriteObj(chan, rangePtr);
++	Tcl_DecrRefCount(rangePtr);
++	return result;
++    }
++    src = TclGetStringFromObj(objPtr, &srcLen);
++    if (numBytes >= srcLen) {
++	numBytes = srcLen;
++    } else {
++	/* Don't split a character. */
++	numBytes = Tcl_UtfPrev(src + numBytes + 1, src) - src;
++    }
++    return WriteChars(chanPtr, src, numBytes);
++}
++
+ static void
+ WillWrite(
+     Channel *chanPtr)
+ {
+     int inputBuffered;
+@@ -8090,10 +8189,19 @@ Tcl_GetChannelOption(
+ 	    Tcl_DStringAppend(dsPtr, buf, -1);
+ 	    return TCL_OK;
+ 	}
+ 	Tcl_DStringAppendElement(dsPtr, buf);
+     }
++    if (len > 0 && HaveOpt(3, "-epipe")) {
++	/*
++	 * L: -epipe is not listed with all options, for compatibility.
++	 */
++
++	Tcl_DStringAppendElement(dsPtr,
++		(flags & CHANNEL_EXIT_ON_EPIPE) ? "exit" : "error");
++	return TCL_OK;
++    }
+     if (len == 0 || HaveOpt(1, "-profile")) {
+ 	int profile;
+ 	const char *profileName;
+ 	if (len == 0) {
+ 	    Tcl_DStringAppendElement(dsPtr, "-profile");
+@@ -8277,10 +8385,11 @@ Tcl_SetChannelOption(
+ 
+ 	obj.refCount = 1;
+ 	obj.bytes = (char *)newValue;
+ 	obj.length = strlen(newValue);
+ 	obj.typePtr = NULL;
++	obj.undef = 0;
+ 
+ 	code = Tcl_GetWideIntFromObj(interp, &obj, &newBufferSize);
+ 	TclFreeInternalRep(&obj);
+ 
+ 	if (code == TCL_ERROR) {
+@@ -8362,10 +8471,24 @@ Tcl_SetChannelOption(
+ 	    statePtr->inputEncodingFlags |= TCL_ENCODING_START;
+ 	}
+ 	ResetFlag(statePtr, CHANNEL_EOF|CHANNEL_STICKY_EOF|CHANNEL_BLOCKED);
+ 	statePtr->inputEncodingFlags &= ~TCL_ENCODING_END;
+ 	return TCL_OK;
++    } else if (HaveOpt(3, "-epipe")) {
++	if (!strcmp(newValue, "exit")) {
++	    SetFlag(statePtr, CHANNEL_EXIT_ON_EPIPE);
++	    return TCL_OK;
++	} else if (!strcmp(newValue, "error")) {
++	    ResetFlag(statePtr, CHANNEL_EXIT_ON_EPIPE);
++	    return TCL_OK;
++	}
++	if (interp) {
++	    Tcl_SetObjResult(interp, Tcl_NewStringObj(
++		    "bad value for -epipe: must be one of exit or error",
++		    TCL_INDEX_NONE));
++	}
++	return TCL_ERROR;
+     } else if (HaveOpt(1, "-profile")) {
+ 	int profile;
+ 	if (TclEncodingProfileNameToId(interp, newValue, &profile) != TCL_OK) {
+ 	    return TCL_ERROR;
+ 	}
+diff --git i/generic/tclIO.h w/generic/tclIO.h
+index 67f6f61a04b7..de4e4d032a83 100644
+--- i/generic/tclIO.h
++++ w/generic/tclIO.h
+@@ -271,13 +271,16 @@ enum ChannelStateFlags {
+ 				 * flushed immediately. */
+     CHANNEL_INCLOSE = 1<<19,	/* Channel is currently being closed. Its
+ 				 * structures are still live and usable, but
+ 				 * it may not be closed again from within the
+ 				 * close handler. */
+-    CHANNEL_CLOSEDWRITE = 1<<21	/* Channel write side has been closed. No
++    CHANNEL_CLOSEDWRITE = 1<<21,/* Channel write side has been closed. No
+ 				 * further Tcl-level write IO on the channel
+ 				 * is allowed. */
++    CHANNEL_EXIT_ON_EPIPE = 1<<22
++				/* Exit on EPIPE (broken pipe) error on the
++				 * stdout channel (L). */
+ };
+ 
+ /*
+  * The length of time to wait between synthetic timer events. Must be zero or
+  * bad things tend to happen.
+diff --git i/generic/tclIOCmd.c w/generic/tclIOCmd.c
+index e13f45214955..32d45b322dde 100644
+--- i/generic/tclIOCmd.c
++++ w/generic/tclIOCmd.c
+@@ -220,10 +220,16 @@ Tcl_PutsObjCmd(
+      * them into the regular interpreter result. Fall back to the regular
+      * message if nothing was found in the bypass.
+      */
+ 
+   error:
++    if ((Tcl_GetErrno() == EPIPE) && (chan == Tcl_GetStdChannel(TCL_STDOUT))
++	    && (((Channel *)chan)->state->flags & CHANNEL_EXIT_ON_EPIPE)) {
++	/* L: exit silently on a broken stdout pipe (fconfigure -epipe). */
++	Tcl_Exit(0);
++	/*NOTREACHED*/
++    }
+     if (!TclChanCaughtErrorBypass(interp, chan)) {
+ 	Tcl_SetObjResult(interp, Tcl_ObjPrintf("error writing \"%s\": %s",
+ 		TclGetString(chanObjPtr), Tcl_PosixError(interp)));
+     }
+     TclChannelRelease(chan);
+diff --git i/generic/tclIOUtil.c w/generic/tclIOUtil.c
+index 3dacc1d0711d..91459fca0447 100644
+--- i/generic/tclIOUtil.c
++++ w/generic/tclIOUtil.c
+@@ -19,10 +19,11 @@
+ #include "tclIO.h"
+ #ifdef _WIN32
+ #   include "tclWinInt.h"
+ #endif
+ #include "tclFileSystem.h"
++#include "Lcompile.h"
+ 
+ #ifdef TCL_TEMPLOAD_NO_UNLINK
+ #ifndef NO_FSTATFS
+ #include <sys/statfs.h>
+ #endif
+@@ -68,10 +69,12 @@ typedef struct {
+ 
+ static Tcl_NRPostProc	EvalFileCallback;
+ static FilesystemRecord*FsGetFirstFilesystem(void);
+ static void		FsThrExitProc(void *cd);
+ static Tcl_Obj *	FsListMounts(Tcl_Obj *pathPtr, const char *pattern);
++static Tcl_Obj *	FsMaybeWrapInLLang(Tcl_Obj *fileContents,
++			    const char *path);
+ static void		FsAddMountsToGlobResult(Tcl_Obj *resultPtr,
+ 			    Tcl_Obj *pathPtr, const char *pattern,
+ 			    Tcl_GlobTypeData *types);
+ static void		FsUpdateCwd(Tcl_Obj *cwdObj, void *clientData);
+ static void		FsRecacheFilesystemList(void);
+@@ -1780,10 +1783,11 @@ Tcl_FSEvalFileEx(
+ 
+     iPtr = (Interp *) interp;
+     oldScriptFile = iPtr->scriptFile;
+     iPtr->scriptFile = pathPtr;
+     Tcl_IncrRefCount(iPtr->scriptFile);
++    objPtr = FsMaybeWrapInLLang(objPtr, TclGetString(pathPtr));
+     string = TclGetStringFromObj(objPtr, &length);
+ 
+     /*
+      * TIP #280:  Open a frame for the evaluated script.
+      */
+@@ -1919,10 +1923,11 @@ TclNREvalFile(
+ 
+     iPtr = (Interp *) interp;
+     oldScriptFile = iPtr->scriptFile;
+     iPtr->scriptFile = pathPtr;
+     Tcl_IncrRefCount(iPtr->scriptFile);
++    objPtr = FsMaybeWrapInLLang(objPtr, TclGetString(pathPtr));
+ 
+     /*
+      * TIP #280:  Open a frame for the evaluated script.
+      */
+ 
+@@ -1930,10 +1935,63 @@ TclNREvalFile(
+     TclNRAddCallback(interp, EvalFileCallback, oldScriptFile, pathPtr, objPtr,
+ 	    NULL);
+     return TclNREvalObjEx(interp, objPtr, 0, NULL, INT_MIN);
+ }
+ 
++/*
++ *----------------------------------------------------------------------
++ *
++ * FsMaybeWrapInLLang --
++ *
++ *	Handle L and html/L code.  If the path ends in .l (or L forcing is
++ *	on), precede the file contents with "#lang L".  If the path ends in
++ *	.lhtml, with "#lang Lhtml".
++ *
++ * Results:
++ *	A Tcl_Obj (with a reference held for the caller) containing the
++ *	potentially wrapped script.  The reference on fileContents is
++ *	transferred to the result.
++ *
++ *----------------------------------------------------------------------
++ */
++
++static Tcl_Obj *
++FsMaybeWrapInLLang(
++    Tcl_Obj *fileContents,
++    const char *path)
++{
++    Tcl_Size flen;
++    size_t plen = strlen(path);
++    const char *s = TclGetStringFromObj(fileContents, &flen);
++    const char *append = "";
++    const char *lang = NULL;
++    Tcl_Obj *newContents;
++
++    if (((plen >= 2) && !strcmp(path + plen - 2, ".l"))
++	    || (L && L->global->forceL)) {
++	lang = "L";
++	if (L) {
++	    L->global->forceL = 0;
++	}
++    } else if ((plen >= 6) && !strcmp(path + plen - 6, ".lhtml")) {
++	lang = "Lhtml";
++    }
++    if (lang == NULL) {
++	return fileContents;
++    }
++
++    /* Append a newline if not already there. */
++    if (flen && (s[flen-1] != '\n')) {
++	append = "\n";
++    }
++    newContents = Tcl_ObjPrintf("#lang %s --lineadj=-1\n%s%s#lang tcl",
++	    lang, s, append);
++    Tcl_IncrRefCount(newContents);
++    Tcl_DecrRefCount(fileContents);
++    return newContents;
++}
++
+ static int
+ EvalFileCallback(
+     void *data[],
+     Tcl_Interp *interp,
+     int result)
+diff --git i/generic/tclInt.h w/generic/tclInt.h
+index 98790e206b22..d52651541766 100644
+--- i/generic/tclInt.h
++++ w/generic/tclInt.h
+@@ -2441,10 +2441,12 @@ enum InterpFlags {
+ 				 * initialized. This is set when we first use
+ 				 * the rand() or srand() functions. */
+     SAFE_INTERP = 0x80,		/* The current interp is a safe interp (i.e.,
+ 				 * it has only the safe commands installed,
+ 				 * less privilege than a regular interp). */
++    INTERP_PCRE = 0x100,	/* Use the PCRE engine by default for REs
++				 * (L). */
+     INTERP_TRACE_IN_PROGRESS = 0x200,
+ 				/* An interp trace is currently active; so no
+ 				 * further trace callbacks should be invoked. */
+     INTERP_ALTERNATE_WRONG_ARGS = 0x400,
+ 				/* Used for listing second and subsequent forms
+@@ -3913,10 +3915,45 @@ MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_UplevelObjCmd;
+ MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_UpvarObjCmd;
+ MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_VariableObjCmd;
+ MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_VwaitObjCmd;
+ MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_WhileObjCmd;
+ 
++/*
++ * Commands for the L language (see Lcompile.c).
++ */
++
++MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_LObjCmd;
++MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_LHtmlObjCmd;
++MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_ShSplitObjCmd;
++MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_FGetlineObjCmd;
++MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_LAngleReadObjCmd;
++MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_LReadCmd;
++MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_LWriteCmd;
++MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_LRefCnt;
++MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_LDefined;
++MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_LGetNextLine;
++MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_LGetNextLineInit;
++MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_LGetDirX;
++MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_GetOptObjCmd;
++MODULE_SCOPE Tcl_ObjCmdProc2 Tcl_GetOptResetObjCmd;
++MODULE_SCOPE void	TclLInitCompiler(Tcl_Interp *interp);
++MODULE_SCOPE void	TclLCleanupCompiler(void *clientData,
++			    Tcl_Interp *interp);
++MODULE_SCOPE int	TclDuplicateListRep(Tcl_Obj *objPtr);
++MODULE_SCOPE Tcl_Size	Tcl_WriteObjN(Tcl_Channel chan, Tcl_Obj *objPtr,
++			    Tcl_Size numBytes);
++MODULE_SCOPE void	TclSetStdoutExitOnEpipe(void);
++
++/*
++ * The PCRE variant of the [regexp] command (see tclRegexp.c).
++ */
++
++MODULE_SCOPE int	TclRegexpPCRE(Tcl_Interp *interp, Tcl_Size objc,
++			    Tcl_Obj *const objv[], Tcl_RegExp regExpr,
++			    int all, int indices, int doinline,
++			    Tcl_Size offset);
++
+ /*
+  *----------------------------------------------------------------
+  * Compilation procedures for commands in the generic core:
+  *----------------------------------------------------------------
+  */
+@@ -4338,11 +4375,12 @@ MODULE_SCOPE int	TclListLimitExceededError(Tcl_Interp *interp);
+  * allocates and frees a single Tcl_Obj so that tools like Purify can better
+  * track memory leaks.
+  */
+ 
+ #  define TclAllocObjStorageEx(interp, objPtr) \
+-	(objPtr) = (Tcl_Obj *)Tcl_Alloc(sizeof(Tcl_Obj))
++	(objPtr) = (Tcl_Obj *)Tcl_Alloc(sizeof(Tcl_Obj));		\
++	(objPtr)->undef = 0
+ 
+ #  define TclFreeObjStorageEx(interp, objPtr) \
+ 	Tcl_Free(objPtr)
+ 
+ #undef USE_THREAD_ALLOC
+@@ -4384,10 +4422,11 @@ MODULE_SCOPE void	TclpFreeAllocCache(void *);
+ 	} else {							\
+ 	    (objPtr) = cachePtr->firstObjPtr;				\
+ 	    cachePtr->firstObjPtr = (Tcl_Obj *)(objPtr)->internalRep.twoPtrValue.ptr1; \
+ 	    --cachePtr->numObjects;					\
+ 	}								\
++	(objPtr)->undef = 0;						\
+     } while (0)
+ 
+ #  define TclFreeObjStorageEx(interp, objPtr)				\
+     do {								\
+ 	AllocCache *cachePtr;						\
+@@ -4425,10 +4464,11 @@ MODULE_SCOPE Tcl_Mutex	tclObjMutex;
+ 	}								\
+ 	(objPtr) = tclFreeObjList;					\
+ 	tclFreeObjList = (Tcl_Obj *)					\
+ 		tclFreeObjList->internalRep.twoPtrValue.ptr1;		\
+ 	Tcl_MutexUnlock(&tclObjMutex);					\
++	(objPtr)->undef = 0;						\
+     } while (0)
+ 
+ #  define TclFreeObjStorageEx(interp, objPtr) \
+     do {								\
+ 	Tcl_MutexLock(&tclObjMutex);					\
+diff --git i/generic/tclInterp.c w/generic/tclInterp.c
+index dd2908e96323..bbeb9e984098 100644
+--- i/generic/tclInterp.c
++++ w/generic/tclInterp.c
+@@ -897,10 +897,11 @@ TclInterpInit(
+ 
+     Tcl_NRCreateCommand2(interp, "interp", Tcl_InterpObjCmd, NRInterpCmd,
+ 	    NULL, NULL);
+     Tcl_CreateObjCommand2(interp, INIT_AUTO_PATH_CMD, InitAutoPathObjCmd,
+ 	    NULL, NULL);
++    TclLInitCompiler(interp);
+     Tcl_CallWhenDeleted(interp, InterpInfoDeleteProc, NULL);
+     return TCL_OK;
+ }
+ 
+ /*
+@@ -1019,11 +1020,11 @@ NRInterpCmd(
+     static const char *const options[] = {
+ 	"alias",	"aliases",	"bgerror",	"cancel",
+ 	"children",	"create",	"debug",	"delete",
+ 	"eval",		"exists",	"expose",	"hide",
+ 	"hidden",	"issafe",	"invokehidden",
+-	"limit",	"marktrusted",	"recursionlimit",
++	"limit",	"marktrusted",	"recursionlimit",	"regexp",
+ 	"set",		"share",
+ #ifndef TCL_NO_DEPRECATED
+ 	"slaves",
+ #endif
+ 	"target",	"transfer",	NULL
+@@ -1032,19 +1033,19 @@ NRInterpCmd(
+ 	"alias",	"aliases",	"bgerror",	"cancel",
+ 	"children",	"create",	"debug",	"delete",
+ 	"eval",		"exists",	"expose",
+ 	"hide",		"hidden",	"issafe",
+ 	"invokehidden",	"limit",	"marktrusted",	"recursionlimit",
+-	"set",		"share",	"target",	"transfer",
++	"regexp",	"set",		"share",	"target",	"transfer",
+ 	NULL
+     };
+     enum interpOptionEnum {
+ 	OPT_ALIAS,	OPT_ALIASES,	OPT_BGERROR,	OPT_CANCEL,
+ 	OPT_CHILDREN,	OPT_CREATE,	OPT_DEBUG,	OPT_DELETE,
+ 	OPT_EVAL,	OPT_EXISTS,	OPT_EXPOSE,	OPT_HIDE,
+ 	OPT_HIDDEN,	OPT_ISSAFE,	OPT_INVOKEHID,
+-	OPT_LIMIT,	OPT_MARKTRUSTED, OPT_RECLIMIT,	OPT_SET,
++	OPT_LIMIT,	OPT_MARKTRUSTED, OPT_RECLIMIT,	OPT_REGEXP,	OPT_SET,
+ 	OPT_SHARE,
+ #ifndef TCL_NO_DEPRECATED
+ 	OPT_SLAVES,
+ #endif
+ 	OPT_TARGET,	OPT_TRANSFER
+@@ -1465,10 +1466,51 @@ NRInterpCmd(
+ 		    Tcl_NewStringObj(string, -1));
+ 	}
+ 	Tcl_SetObjResult(interp, resultPtr);
+ 	return TCL_OK;
+     }
++    case OPT_REGEXP: {
++	Interp *childIPtr;
++	int reType;
++	static const char *const reTypeOpts[] = {
++	    "classic",	"pcre",	NULL
++	};
++	enum reTypeOpts {
++	    RETYPE_CLASSIC,	RETYPE_PCRE
++	};
++
++	if (objc != 3 && objc != 4) {
++	    Tcl_WrongNumArgs(interp, 2, objv, "path ?type?");
++	    return TCL_ERROR;
++	}
++	childIPtr = (Interp *) GetInterp(interp, objv[2]);
++	if (childIPtr == NULL) {
++	    return TCL_ERROR;
++	}
++	if (objc == 4) {
++	    if (Tcl_GetIndexFromObj(interp, objv[3], reTypeOpts, "type",
++		    0, &reType) != TCL_OK) {
++		return TCL_ERROR;
++	    }
++	    if ((enum reTypeOpts) reType == RETYPE_PCRE) {
++		childIPtr->flags |= INTERP_PCRE;
++	    } else {
++		childIPtr->flags &= ~INTERP_PCRE;
++	    }
++
++	    /*
++	     * Compiled regexp commands depend on the engine in use, so
++	     * invalidate all bytecode.
++	     */
++
++	    childIPtr->compileEpoch++;
++	}
++	Tcl_SetObjResult(interp, Tcl_NewStringObj(
++		(childIPtr->flags & INTERP_PCRE) ? "pcre" : "classic",
++		TCL_INDEX_NONE));
++	return TCL_OK;
++    }
+     case OPT_TRANSFER:
+     case OPT_SHARE: {
+ 	Tcl_Interp *parentInterp;	/* The parent of the child. */
+ 	Tcl_Channel chan;
+ 
+diff --git i/generic/tclListObj.c w/generic/tclListObj.c
+index a6ce86a12036..bffb79784858 100644
+--- i/generic/tclListObj.c
++++ w/generic/tclListObj.c
+@@ -1760,16 +1760,34 @@ Tcl_ListObjAppendList(
+  * Side effects:
+  *	None.
+  *
+  *------------------------------------------------------------------------
+  */
++static int ListObjAppendElements(Tcl_Interp *interp, Tcl_Obj *toObj,
++			    Tcl_Size elemCount, Tcl_Obj *const elemObjv[]);
++
+ int
+ TclListObjAppendElements(
+     Tcl_Interp *interp,		/* Used to report errors if not NULL. */
+     Tcl_Obj *toObj,		/* List object to append */
+     Tcl_Size elemCount,		/* Number of elements in elemObjs[] */
+     Tcl_Obj *const elemObjv[])	/* Objects to append to toObj's list. */
++{
++    int result = ListObjAppendElements(interp, toObj, elemCount, elemObjv);
++
++    if (result == TCL_OK) {
++	toObj->undef = 0;	/* A modified L undef is no longer undef. */
++    }
++    return result;
++}
++
++static int
++ListObjAppendElements(
++    Tcl_Interp *interp,		/* Used to report errors if not NULL. */
++    Tcl_Obj *toObj,		/* List object to append */
++    Tcl_Size elemCount,		/* Number of elements in elemObjs[] */
++    Tcl_Obj *const elemObjv[])	/* Objects to append to toObj's list. */
+ {
+     ListRep listRep;
+     Tcl_Obj **toObjv;
+     Tcl_Size toLen;
+     Tcl_Size finalLen;
+@@ -2158,18 +2176,40 @@ ListLength(
+  *	to a list object. listObj's old string representation, if any, is
+  *	freed.
+  *
+  *----------------------------------------------------------------------
+  */
++static int ListObjReplace(Tcl_Interp *interp, Tcl_Obj *listObj,
++			    Tcl_Size first, Tcl_Size numToDelete,
++			    Tcl_Size numToInsert, Tcl_Obj *const insertObjs[]);
++
+ int
+ Tcl_ListObjReplace(
+     Tcl_Interp *interp,		/* Used for error reporting if not NULL. */
+     Tcl_Obj *listObj,		/* List object whose elements to replace. */
+     Tcl_Size first,		/* Index of first element to replace. */
+     Tcl_Size numToDelete,	/* Number of elements to replace. */
+     Tcl_Size numToInsert,	/* Number of objects to insert. */
+     Tcl_Obj *const insertObjs[])/* Tcl objects to insert */
++{
++    int result = ListObjReplace(interp, listObj, first, numToDelete,
++	    numToInsert, insertObjs);
++
++    if (result == TCL_OK) {
++	listObj->undef = 0;	/* A modified L undef is no longer undef. */
++    }
++    return result;
++}
++
++static int
++ListObjReplace(
++    Tcl_Interp *interp,		/* Used for error reporting if not NULL. */
++    Tcl_Obj *listObj,		/* List object whose elements to replace. */
++    Tcl_Size first,		/* Index of first element to replace. */
++    Tcl_Size numToDelete,	/* Number of elements to replace. */
++    Tcl_Size numToInsert,	/* Number of objects to insert. */
++    Tcl_Obj *const insertObjs[])/* Tcl objects to insert */
+ {
+     ListRep listRep;
+     Tcl_Size origListLen;
+     Tcl_Size lenChange;
+     Tcl_Size leadSegmentLen;
+@@ -3345,10 +3385,52 @@ FreeListInternalRep(
+  * Side effects:
+  *	The reference count of the List internal rep is incremented.
+  *
+  *----------------------------------------------------------------------
+  */
++/*
++ *----------------------------------------------------------------------
++ *
++ * TclDuplicateListRep --
++ *
++ *	Make sure a list object has its own, unshared list internal
++ *	representation, so that its elements can be modified in place
++ *	through pointers into its element array (as the L deep-dive bytecodes
++ *	do). The object itself must be unshared.
++ *
++ * Results:
++ *	TCL_OK, or TCL_ERROR if the object cannot be converted to a list.
++ *
++ * Side effects:
++ *	Converts the object to a list if necessary. If the list's ListStore
++ *	is shared (or the list is a span of a larger store), the object's
++ *	internal representation is replaced by a newly allocated copy and its
++ *	string representation is invalidated.
++ *
++ *----------------------------------------------------------------------
++ */
++
++int
++TclDuplicateListRep(
++    Tcl_Obj *objPtr)
++{
++    ListRep listRep;
++
++    if (!TclHasInternalRep(objPtr, &tclListType)
++	    && (SetListFromAny(NULL, objPtr) != TCL_OK)) {
++	return TCL_ERROR;
++    }
++    ListObjGetRep(objPtr, &listRep);
++    if (ListRepIsShared(&listRep) || listRep.spanPtr) {
++	ListRep newRep;
++
++	ListRepClone(&listRep, &newRep, LISTREP_PANIC_ON_FAIL);
++	ListObjReplaceRepAndInvalidate(objPtr, &newRep);
++    }
++    return TCL_OK;
++}
++
+ static void
+ DupListInternalRep(
+     Tcl_Obj *srcObj,		/* Object with internal rep to copy. */
+     Tcl_Obj *copyObj)		/* Object with internal rep to set. */
+ {
+diff --git i/generic/tclMain.c w/generic/tclMain.c
+index 44a610256c29..88f29e4f5286 100644
+--- i/generic/tclMain.c
++++ w/generic/tclMain.c
+@@ -21,10 +21,11 @@
+  * _UNICODE defined. This way both Tcl_Main and Tcl_MainExW can be
+  * implemented, sharing the same source code.
+  */
+ 
+ #include "tclInt.h"
++#include "Lcompile.h"
+ 
+ /*
+  * The default prompt used when the user has not overridden it.
+  */
+ 
+@@ -290,10 +291,11 @@ Tcl_MainEx(
+ {
+     Tcl_Size i=0;		/* argv[i] index */
+     Tcl_Obj *path, *resultPtr, *argvPtr, *appName;
+     const char *encodingName = NULL;
+     int code, exitCode = 0;
++    int isL = 0;		/* Linked to ::L; interactive input is L */
+     Tcl_MainLoopProc *mainLoopProc;
+     Tcl_Channel chan;
+     InteractiveState is;
+ 
+     if (argc > 0) {
+@@ -313,29 +315,69 @@ Tcl_MainEx(
+      * encoding.
+      */
+ 
+     if (NULL == Tcl_GetStartupScript(NULL)) {
+ 	/*
+-	 * Check whether first 3 args (argv[1] - argv[3]) look like
++	 * Check whether initial args (argv[1] and beyond) look like
+ 	 *  -encoding ENCODING FILENAME
+ 	 * or like
+-	 *  FILENAME
++	 *  [-opt1] [-opt2] ... [-optn] FILENAME
+ 	 */
+ 
++	/* Create argv list obj for L. */
++	L->global->tclsh_argc = 1;
++	L->global->tclsh_argv = Tcl_NewObj();
++	Tcl_IncrRefCount(L->global->tclsh_argv);
++	Tcl_ListObjAppendElement(NULL, L->global->tclsh_argv,
++		argv[0] ? NewNativeObj(argv[0])
++			: Tcl_NewStringObj("tclsh", TCL_INDEX_NONE));
++
+ 	/* mind argc is being adjusted as we proceed */
+ 	if ((argc >= 3) && (0 == _tcscmp(TEXT("-encoding"), argv[1]))
+ 		&& ('-' != argv[3][0])) {
+ 	    Tcl_Obj *value = NewNativeObj(argv[2]);
+ 	    Tcl_SetStartupScript(NewNativeObj(argv[3]),
+ 		    Tcl_GetString(value));
+ 	    Tcl_DecrRefCount(value);
+ 	    argc -= 3;
+ 	    i += 3;
+-	} else if ((argc >= 1) && ('-' != argv[1][0])) {
+-	    Tcl_SetStartupScript(NewNativeObj(argv[1]), NULL);
+-	    argc--;
+-	    i++;
++	} else {
++	    /*
++	     * Pass over any L command-line options (like --norun) to look for
++	     * the file name.  They are kept for L in L->global->tclsh_argv.
++	     */
++
++	    while (argc >= 1) {
++		Tcl_Obj *argObj = NewNativeObj(argv[i]);
++
++		const char *arg = TclGetString(argObj);
++
++		/*
++		 * Consume known L options and any --long option (so that L
++		 * can complain about it); other -options keep the stock tclsh
++		 * meaning (no startup script).
++		 */
++
++		if (!L_isCmdLineOption(arg)
++			&& !((arg[0] == '-') && (arg[1] == '-') && arg[2])) {
++		    Tcl_BounceRefCount(argObj);
++		    break;
++		}
++		Tcl_ListObjAppendElement(NULL, L->global->tclsh_argv, argObj);
++		++L->global->tclsh_argc;
++		argc--;
++		i++;
++	    }
++	    if ((argc >= 1) && ('-' != argv[i][0])) {
++		Tcl_Obj *argObj = NewNativeObj(argv[i]);
++
++		Tcl_ListObjAppendElement(NULL, L->global->tclsh_argv, argObj);
++		++L->global->tclsh_argc;
++		Tcl_SetStartupScript(argObj, NULL);
++		argc--;
++		i++;
++	    }
+ 	}
+     }
+ 
+     path = Tcl_GetStartupScript(&encodingName);
+     if (path != NULL) {
+@@ -346,16 +388,19 @@ Tcl_MainEx(
+ 	appName = Tcl_NewStringObj("tclsh", -1);
+     }
+     Tcl_SetVar2Ex(interp, "argv0", NULL, appName, TCL_GLOBAL_ONLY);
+ 
+     Tcl_SetVar2Ex(interp, "argc", NULL, Tcl_NewWideIntObj(argc), TCL_GLOBAL_ONLY);
++    L->global->script_argc = (int) argc;
+ 
+     argvPtr = Tcl_NewListObj(0, NULL);
+     while (argc--) {
+ 	Tcl_ListObjAppendElement(NULL, argvPtr, NewNativeObj(argv[i++]));
+     }
+     Tcl_SetVar2Ex(interp, "argv", NULL, argvPtr, TCL_GLOBAL_ONLY);
++    L->global->script_argv = argvPtr;
++    Tcl_IncrRefCount(argvPtr);
+ 
+     /*
+      * Set the "tcl_interactive" variable.
+      */
+ 
+@@ -392,17 +437,53 @@ Tcl_MainEx(
+ 
+ 	/* ARGH Munchhausen effect */
+ 	Tcl_CreateExitHandler(FreeMainInterp, interp);
+     }
+ 
++    /*
++     * L: exit silently on a broken stdout pipe, so that things like
++     *   tclsh myscript.l | more
++     * exit silently when you type 'q'.
++     */
++
++    TclSetStdoutExitOnEpipe();
++
+     /*
+      * Invoke the script specified on the command line, if any. Must fetch it
+      * again, as the appInitProc might have reset it.
+      */
+ 
+     path = Tcl_GetStartupScript(&encodingName);
+     if (path != NULL) {
++	/*
++	 * Set L->global->forceL if argv[0] is "L", or "-L" or "--L" was given
++	 * as a cmd-line option.  This causes Tcl_FSEvalFileEx() to wrap the
++	 * input file in a #lang L regardless of its extension.
++	 */
++
++	if (L->global->tclsh_argv) {
++	    Tcl_Size argc2, j;
++	    Tcl_Obj **argvObjs, *pathObj;
++
++	    Tcl_ListObjGetElements(NULL, L->global->tclsh_argv, &argc2,
++		    &argvObjs);
++	    pathObj = Tcl_FSGetNormalizedPath(interp, argvObjs[0]);
++	    if (pathObj) {
++		const char *av0path = TclGetString(pathObj);
++		size_t len = strlen(av0path);
++
++		L->global->forceL = (len >= 2) &&
++			!strcmp(av0path + len - 2, "/L");
++	    }
++	    for (j = 1; j < argc2; ++j) {
++		if (!strcmp(TclGetString(argvObjs[j]), "--L") ||
++			!strcmp(TclGetString(argvObjs[j]), "-L")) {
++		    L->global->forceL = 1;
++		}
++	    }
++	}
++
+ 	Tcl_ResetResult(interp);
+ 	code = Tcl_FSEvalFileEx(interp, path, encodingName);
+ 	if (code != TCL_OK) {
+ 	    chan = Tcl_GetStdChannel(TCL_STDERR);
+ 	    if (chan) {
+@@ -443,10 +524,11 @@ Tcl_MainEx(
+ 
+     /*
+      * Get a new value for tty if anyone writes to ::tcl_interactive
+      */
+ 
++    Tcl_LinkVar(interp, "L", &isL, TCL_LINK_BOOLEAN);
+     Tcl_LinkVar(interp, "tcl_interactive", &is.tty, TCL_LINK_BOOLEAN);
+     is.input = Tcl_GetStdChannel(TCL_STDIN);
+     while ((is.input != NULL) && !Tcl_InterpDeleted(interp)) {
+ 	mainLoopProc = TclGetMainLoop();
+ 	if (mainLoopProc == NULL) {
+@@ -489,10 +571,25 @@ Tcl_MainEx(
+ 		 */
+ 
+ 		break;
+ 	    }
+ 
++	    /*
++	     * Check for the #lang comments and sub them out for meaningful
++	     * commands.
++	     */
++
++	    {
++		const char *commandStr = TclGetString(is.commandPtr);
++
++		if (!isL && !strncasecmp(commandStr, "#lang l", 7)) {
++		    Tcl_SetStringObj(is.commandPtr, "set ::L 1", -1);
++		} else if (isL && !strncasecmp(commandStr, "#lang tcl", 9)) {
++		    Tcl_SetStringObj(is.commandPtr, "set('::L',0);", -1);
++		}
++	    }
++
+ 	    /*
+ 	     * Add the newline removed by Tcl_GetsObj back to the string. Have
+ 	     * to add it back before testing completeness, because it can make
+ 	     * a difference. [Bug 1775878]
+ 	     */
+@@ -508,10 +605,27 @@ Tcl_MainEx(
+ 		continue;
+ 	    }
+ 
+ 	    is.prompt = PROMPT_START;
+ 
++	    if (isL) {
++		Tcl_Size commandLen;
++		const char *commandStr = TclGetStringFromObj(is.commandPtr,
++			&commandLen);
++		Tcl_Obj *LObj = Tcl_NewStringObj("L {", -1);
++
++		/* Strip the trailing newline added above. */
++		Tcl_AppendToObj(LObj, commandStr, commandLen - 1);
++		if ((commandLen < 2) || (commandStr[commandLen-2] != ';')) {
++		    Tcl_AppendToObj(LObj, ";", 1);
++		}
++		Tcl_AppendToObj(LObj, "}\n", 2);
++		Tcl_DecrRefCount(is.commandPtr);
++		is.commandPtr = LObj;
++		Tcl_IncrRefCount(is.commandPtr);
++	    }
++
+ 	    /*
+ 	     * The final newline is syntactically redundant, and causes some
+ 	     * error messages troubles deeper in, so lop it back off.
+ 	     */
+ 
+diff --git i/generic/tclNamesp.c w/generic/tclNamesp.c
+index e8f868bc86e0..e6eae9e42827 100644
+--- i/generic/tclNamesp.c
++++ w/generic/tclNamesp.c
+@@ -5020,16 +5020,26 @@ TclLogCommandInfo(
+ 	return;
+     }
+ 
+     if (command != NULL) {
+ 	/*
+-	 * Compute the line number where the error occurred.
++	 * Compute the line number where the error occurred, honoring #line
++	 * directives generated by the L compiler.
+ 	 */
+ 
++	int line;
++
+ 	iPtr->errorLine = 1;
++	if (!strncmp(script, "#line ", 6)
++		&& ((line = (int) strtoul(script + 6, NULL, 10)) > 0)) {
++	    iPtr->errorLine = line - 1;
++	}
+ 	for (p = script; p != command; p++) {
+-	    if (*p == '\n') {
++	    if (!strncmp(p, "\n#line ", 7)
++		    && ((line = (int) strtoul(p + 7, NULL, 10)) > 0)) {
++		iPtr->errorLine = line - 1;
++	    } else if (*p == '\n') {
+ 		iPtr->errorLine++;
+ 	    }
+ 	}
+ 
+ 	if (length < 0) {
+diff --git i/generic/tclObj.c w/generic/tclObj.c
+index 01ebf1bcfb1b..27f099c779ad 100644
+--- i/generic/tclObj.c
++++ w/generic/tclObj.c
+@@ -1036,10 +1036,11 @@ TclDbInitNewObj(
+ 				 * function; used for debugging. */
+     int line)			/* Line number in the source file; used for
+ 				 * debugging. */
+ {
+     objPtr->refCount = 0;
++    objPtr->undef = 0;
+     objPtr->typePtr = NULL;
+     TclInitEmptyStringRep(objPtr);
+ 
+ #if TCL_THREADS
+     /*
+@@ -1554,10 +1555,11 @@ TclObjBeingDeleted(
+ 	    } else {							\
+ 		(dupPtr)->internalRep = (objPtr)->internalRep;		\
+ 		(dupPtr)->typePtr = typePtr;				\
+ 	    }								\
+ 	}								\
++	(dupPtr)->undef = (objPtr)->undef;				\
+     }
+ 
+ Tcl_Obj *
+ Tcl_DuplicateObj(
+     Tcl_Obj *objPtr)		/* The object to duplicate. */
+@@ -1965,10 +1967,15 @@ Tcl_GetBoolFromObj(
+ 		    TCL_INDEX_NONE, NULL, 0);
+ 	    Tcl_DecrRefCount(objPtr);
+ 	}
+ 	return TCL_ERROR;
+     }
++    if (objPtr->undef) {
++	/* The L undef value is false. */
++	result = 0;
++	goto boolEnd;
++    }
+     do {
+ 	if (TclHasInternalRep(objPtr, &tclIntType)
+ 		|| TclHasInternalRep(objPtr, &tclBooleanType)) {
+ 	    result = (objPtr->internalRep.wideValue != 0);
+ 	    goto boolEnd;
+@@ -4608,11 +4615,11 @@ Tcl_RepresentationCmd(
+      */
+ 
+     descObj = Tcl_ObjPrintf("value is a %s with a refcount of %" TCL_SIZE_MODIFIER "d,"
+ 	    " object pointer at %p",
+ 	    objv[1]->typePtr ? objv[1]->typePtr->name : "pure string",
+-	    objv[1]->refCount, objv[1]);
++	    (Tcl_Size) objv[1]->refCount, objv[1]);
+ 
+     if (objv[1]->typePtr) {
+ 	if (TclHasInternalRep(objv[1], &tclDoubleType)) {
+ 	    Tcl_AppendPrintfToObj(descObj, ", internal representation %g",
+ 		    objv[1]->internalRep.doubleValue);
+diff --git i/generic/tclParse.c w/generic/tclParse.c
+index 3a40a40edacd..335349108a90 100644
+--- i/generic/tclParse.c
++++ w/generic/tclParse.c
+@@ -117,10 +117,13 @@ const unsigned char tclCharTypeTable[] = {
+ 
+ /*
+  * Prototypes for local functions defined in this file:
+  */
+ 
++static int		ParseLang(Tcl_Interp *interp, const char *src,
++			    Tcl_Size numBytes, Tcl_Parse *parsePtr,
++			    Tcl_Size *scannedPtr);
+ static bool		CommandComplete(const char *script, Tcl_Size numBytes);
+ static Tcl_Size		ParseComment(const char *src, Tcl_Size numBytes,
+ 			    Tcl_Parse *parsePtr);
+ static int		ParseTokens(const char *src, Tcl_Size numBytes, int mask,
+ 			    int flags, Tcl_Parse *parsePtr);
+@@ -129,10 +132,164 @@ static Tcl_Size		ParseWhiteSpace(const char *src, Tcl_Size numBytes,
+ static Tcl_Size		ParseAllWhiteSpace(const char *src, Tcl_Size numBytes,
+ 			    int *incompletePtr);
+ static Tcl_Size		ParseHex(const char *src, Tcl_Size numBytes,
+ 			    int *resultPtr);
+ 
++/*
++ *----------------------------------------------------------------------
++ *
++ * FindLangEnd --
++ *
++ *	Find the next "\n#lang" in the numBytes bytes starting at src.
++ *
++ * Results:
++ *	A pointer to the newline before the "#lang", or NULL if there is
++ *	none.
++ *
++ *----------------------------------------------------------------------
++ */
++
++static const char *
++FindLangEnd(
++    const char *src,
++    Tcl_Size numBytes)
++{
++    const char *p = src, *end = src + numBytes;
++
++    while ((p = (const char *)memchr(p, '\n', end - p)) != NULL) {
++	if ((end - p > 5) && !strncmp(p + 1, "#lang", 5)) {
++	    return p;
++	}
++	p++;
++    }
++    return NULL;
++}
++
++/*
++ *----------------------------------------------------------------------
++ *
++ * ParseLang --
++ *
++ *	Scans up to numBytes bytes starting at src, consuming a "#lang"
++ *	language directive (used to embed L code in Tcl scripts).
++ *
++ *	"#lang tcl" is treated as a comment.  "#lang L ?opts?" and
++ *	"#lang Lhtml ?opts?" are turned into the command "L ?opts? code"
++ *	where code is everything up to the next "#lang" line or the end of
++ *	the script.
++ *
++ * Results:
++ *	Records in parsePtr information about the parse. Returns either
++ *	TCL_BREAK, meaning the parsing should continue, TCL_OK meaning a
++ *	language directive was successfully consumed, or TCL_ERROR meaning
++ *	the directive was malformed.
++ *
++ * Side effects:
++ *	None.
++ *
++ *----------------------------------------------------------------------
++ */
++
++static int
++ParseLang(
++    Tcl_Interp *interp,		/* Tcl interpreter */
++    const char *src,		/* First character to parse ("#lang"). */
++    Tcl_Size numBytes,		/* Max number of bytes to scan. */
++    Tcl_Parse *parsePtr,	/* Information about parse in progress. */
++    Tcl_Size *scannedPtr)	/* How many bytes we used */
++{
++    const char *p = src + 5;
++    const char *eol, *end;
++    Tcl_Token *tokenPtr;
++    Tcl_Parse *optsParsePtr;
++    Tcl_Size wordIdx;
++    int isL;
++
++    eol = (const char *)memchr(p, '\n', src + numBytes - p);
++    eol = eol ? eol + 1 : src + numBytes;
++
++    optsParsePtr = (Tcl_Parse *)Tcl_Alloc(sizeof(Tcl_Parse));
++    if (Tcl_ParseCommand(interp, p, eol - p, 0, optsParsePtr) != TCL_OK) {
++	Tcl_Free(optsParsePtr);
++	goto langError;
++    }
++    if ((optsParsePtr->numWords < 1)
++	    || (optsParsePtr->tokenPtr->type != TCL_TOKEN_SIMPLE_WORD)) {
++	Tcl_FreeParse(optsParsePtr);
++	Tcl_Free(optsParsePtr);
++	goto langError;
++    }
++    tokenPtr = optsParsePtr->tokenPtr + 1;
++    if ((tokenPtr->size == 3) && !strncasecmp("tcl", tokenPtr->start, 3)) {
++	/* Treat #lang tcl as a comment. */
++	Tcl_FreeParse(optsParsePtr);
++	Tcl_Free(optsParsePtr);
++	if (!parsePtr->commentStart) {
++	    parsePtr->commentStart = src;
++	}
++	parsePtr->commentSize = eol - parsePtr->commentStart;
++	parsePtr->commandStart = NULL;
++	parsePtr->commandSize = 0;
++	*scannedPtr = eol - src;
++	return TCL_BREAK;
++    }
++    isL = ((tokenPtr->size == 1) && !strncmp("L", tokenPtr->start, 1))
++	    || ((tokenPtr->size == 5) && !strncmp("Lhtml", tokenPtr->start, 5));
++    Tcl_FreeParse(optsParsePtr);
++    Tcl_Free(optsParsePtr);
++    if (!isL) {
++	goto langError;
++    }
++
++    /*
++     * It's L code, so do the parse again, but side-effect the parsePtr this
++     * time.
++     */
++
++    if (Tcl_ParseCommand(interp, p, eol - p, 0, parsePtr) != TCL_OK) {
++	return TCL_ERROR;
++    }
++
++    /*
++     * Now tack on one more word for the L code.
++     */
++
++    end = FindLangEnd(eol, src + numBytes - eol);
++    if (!end) {
++	end = src + numBytes - 1;
++    }
++    TclGrowParseTokenArray(parsePtr, 2);
++    wordIdx = parsePtr->numTokens;
++    tokenPtr = &parsePtr->tokenPtr[wordIdx];
++    tokenPtr->type = TCL_TOKEN_SIMPLE_WORD;
++    tokenPtr->start = eol;
++    tokenPtr->size = end - eol + 1;
++    tokenPtr->numComponents = 1;
++    parsePtr->numTokens++;
++    parsePtr->numWords++;
++
++    tokenPtr = &parsePtr->tokenPtr[wordIdx + 1];
++    *tokenPtr = parsePtr->tokenPtr[wordIdx];
++    tokenPtr->type = TCL_TOKEN_TEXT;
++    tokenPtr->numComponents = 0;
++    parsePtr->numTokens++;
++    parsePtr->commandSize = end + 1 - parsePtr->commandStart;
++    parsePtr->end = src + numBytes;
++    return TCL_OK;
++
++  langError:
++    parsePtr->commandStart = src;
++    parsePtr->commandSize = eol - src;
++    parsePtr->term = eol - 1;
++    parsePtr->errorType = TCL_PARSE_SYNTAX;
++    if (interp) {
++	Tcl_SetObjResult(interp, Tcl_NewStringObj("malformed pragma", -1));
++    }
++    Tcl_FreeParse(parsePtr);
++    return TCL_ERROR;
++}
++
+ /*
+  *----------------------------------------------------------------------
+  *
+  * TclParseInit --
+  *
+@@ -243,19 +400,38 @@ Tcl_ParseCommand(
+     /*
+      * Parse any leading space and comments before the first word of the
+      * command.
+      */
+ 
+-    scanned = ParseComment(start, numBytes, parsePtr);
+-    src = (start + scanned);
++    src = start;
++  comments:
++    scanned = ParseComment(src, numBytes, parsePtr);
++    src += scanned;
+     numBytes -= scanned;
+     if (numBytes == 0) {
+ 	if (nested) {
+ 	    parsePtr->incomplete = nested;
+ 	}
+     }
+ 
++    /*
++     * Check for a language directive (#lang).
++     */
++
++    if ((numBytes >= 5) && !strncmp(src, "#lang", 5)) {
++	int code = ParseLang(interp, src, numBytes, parsePtr, &scanned);
++
++	if (code != TCL_BREAK) {
++	    return code;
++	}
++	src += scanned;
++	numBytes -= scanned;
++	if (numBytes > 0) {
++	    goto comments;
++	}
++    }
++
+     /*
+      * The following loop parses the words of the command, one word in each
+      * iteration through the loop.
+      */
+ 
+@@ -976,11 +1152,12 @@ ParseComment(
+     while (numBytes) {
+ 	Tcl_Size scanned = ParseAllWhiteSpace(p, numBytes, &incomplete);
+ 	p += scanned;
+ 	numBytes -= scanned;
+ 
+-	if ((numBytes == 0) || (*p != '#')) {
++	if ((numBytes == 0) || (*p != '#')
++		|| ((numBytes >= 5) && !strncmp(p, "#lang", 5))) {
+ 	    break;
+ 	}
+ 	if (parsePtr->commentStart == NULL) {
+ 	    parsePtr->commentStart = p;
+ 	}
+diff --git i/generic/tclProc.c w/generic/tclProc.c
+index 96474d738d05..973f562ef08c 100644
+--- i/generic/tclProc.c
++++ w/generic/tclProc.c
+@@ -720,10 +720,11 @@ TclGetFrame(
+     Tcl_Obj obj;
+ 
+     obj.bytes = (char *) name;
+     obj.length = strlen(name);
+     obj.typePtr = NULL;
++    obj.undef = 0;
+     result = TclObjGetFrame(interp, &obj, framePtrPtr);
+     TclFreeInternalRep(&obj);
+     return result;
+ }
+ 
+diff --git i/generic/tclRegexp.c w/generic/tclRegexp.c
+index 194d114c8a74..42b0d1180650 100644
+--- i/generic/tclRegexp.c
++++ w/generic/tclRegexp.c
+@@ -124,10 +124,562 @@ const Tcl_ObjType tclRegexpType = {
+ 	const Tcl_ObjInternalRep *irPtr;				\
+ 	irPtr = TclFetchInternalRep((objPtr), &tclRegexpType);		\
+ 	(rePtr) = irPtr ? (TclRegexp *)irPtr->twoPtrValue.ptr1 : NULL;	\
+     } while (0)
+ 
++#ifdef HAVE_PCRE
++/*
++ *----------------------------------------------------------------------
++ *
++ * PcreNulCopy --
++ *
++ *	Tcl encodes NUL as the (overlong) sequence C0 80, which PCRE2 does
++ *	not accept as UTF-8. If string contains any, return a Tcl_Alloc'd
++ *	copy with real NULs instead (and update *lengthPtr), else NULL.
++ *
++ *----------------------------------------------------------------------
++ */
++
++static char *
++PcreNulCopy(
++    const char *string,
++    Tcl_Size *lengthPtr)
++{
++    Tcl_Size i, j, length = *lengthPtr;
++    char *copy;
++
++    if ((length == 0) || (memchr(string, 0xC0, length) == NULL)) {
++	return NULL;
++    }
++    copy = (char *)Tcl_Alloc(length + 1);
++    for (i = j = 0; i < length; i++, j++) {
++	if ((UCHAR(string[i]) == 0xC0) && (i + 1 < length)
++		&& (UCHAR(string[i+1]) == 0x80)) {
++	    copy[j] = 0;
++	    i++;
++	} else {
++	    copy[j] = string[i];
++	}
++    }
++    copy[j] = 0;
++    *lengthPtr = j;
++    return copy;
++}
++
++/*
++ *----------------------------------------------------------------------
++ *
++ * PcreSubject --
++ *
++ *	Get the subject string for a PCRE match.  Byte arrays are matched
++ *	byte-wise, everything else against its (UTF-8) string rep.
++ *
++ * Results:
++ *	A pointer to the bytes to match; the length is stored in *lengthPtr
++ *	and *isBytesPtr is set to 1 if offsets are byte offsets. If the
++ *	string rep had to be converted (see PcreNulCopy), *copyPtr is set
++ *	to the copy (which the caller must Tcl_Free), else to NULL.
++ *
++ *----------------------------------------------------------------------
++ */
++
++static const char *
++PcreSubject(
++    Tcl_Obj *textObj,
++    Tcl_Size *lengthPtr,
++    int *isBytesPtr,
++    char **copyPtr)
++{
++    const char *string;
++
++    *copyPtr = NULL;
++    if (TclIsPureByteArray(textObj)) {
++	const char *bytes = (const char *)
++		Tcl_GetBytesFromObj(NULL, textObj, lengthPtr);
++
++	if (bytes != NULL) {
++	    *isBytesPtr = 1;
++	    return bytes;
++	}
++    }
++    *isBytesPtr = 0;
++    string = TclGetStringFromObj(textObj, lengthPtr);
++    *copyPtr = PcreNulCopy(string, lengthPtr);
++    return *copyPtr ? *copyPtr : string;
++}
++
++/*
++ *----------------------------------------------------------------------
++ *
++ * PcreError --
++ *
++ *	Leave a PCRE error message in the interpreter, if there is one.
++ *
++ *----------------------------------------------------------------------
++ */
++
++static void
++PcreError(
++    Tcl_Interp *interp,
++    const char *prefix,
++    int errorCode)
++{
++    PCRE2_UCHAR buf[256];
++
++    if (interp == NULL) {
++	return;
++    }
++    if (pcre2_get_error_message(errorCode, buf, sizeof(buf)) < 0) {
++	snprintf((char *) buf, sizeof(buf), "error code %d", errorCode);
++    }
++    Tcl_SetObjResult(interp, Tcl_ObjPrintf("%s%s", prefix, (char *) buf));
++}
++
++/*
++ *----------------------------------------------------------------------
++ *
++ * PcreCompile --
++ *
++ *	Compile a PCRE pattern into regexpPtr, mapping the Tcl RE compile
++ *	flags to their PCRE equivalents.
++ *
++ * Results:
++ *	TCL_OK, or TCL_ERROR with an error message in interp (if not NULL).
++ *
++ *----------------------------------------------------------------------
++ */
++
++static int
++PcreCompile(
++    Tcl_Interp *interp,
++    TclRegexp *regexpPtr,
++    const char *string,
++    size_t length)
++{
++    uint32_t options = PCRE2_DOLLAR_ENDONLY | PCRE2_DOTALL;
++    uint32_t captureCount = 0;
++    int flags = regexpPtr->flags, errorCode;
++    PCRE2_SIZE errorOffset;
++    pcre2_code *code;
++    size_t i;
++    Tcl_Size copyLength = (Tcl_Size) length;
++    char *copy = PcreNulCopy(string, &copyLength);
++
++    /* Pass real NULs to PCRE2 (see PcreNulCopy). */
++    if (copy) {
++	string = copy;
++	length = copyLength;
++    }
++
++    /*
++     * Use UTF-8 mode only if the pattern has non-ASCII characters (as the
++     * PCRE1 based implementation did).  Tcl strings are not guaranteed to
++     * be strictly valid UTF-8, so never let PCRE check that.
++     */
++
++    for (i = 0; i < length; i++) {
++	if (UCHAR(string[i]) >= 0x80) {
++	    options |= PCRE2_UTF | PCRE2_MATCH_INVALID_UTF;
++	    break;
++	}
++    }
++    if (flags & TCL_REG_NOCASE) {
++	options |= PCRE2_CASELESS;
++    }
++    if (flags & TCL_REG_EXPANDED) {
++	options |= PCRE2_EXTENDED;
++    }
++    /* TCL_REG_NLSTOP|TCL_REG_NLANCH == TCL_REG_NEWLINE */
++    if (flags & TCL_REG_NLSTOP) {
++	options &= ~PCRE2_DOTALL;
++    }
++    if (flags & TCL_REG_NLANCH) {
++	options |= PCRE2_MULTILINE;
++	options &= ~PCRE2_DOLLAR_ENDONLY;
++    }
++
++    code = pcre2_compile((PCRE2_SPTR) string, length, options, &errorCode,
++	    &errorOffset, NULL);
++    if (copy) {
++	Tcl_Free(copy);
++    }
++    if (code == NULL) {
++	PcreError(interp, "couldn't compile pcre pattern: ", errorCode);
++	return TCL_ERROR;
++    }
++
++    /*
++     * JIT compilation is an optimisation only; if it isn't available the
++     * interpreter is used instead.
++     */
++
++    (void) pcre2_jit_compile(code, PCRE2_JIT_COMPLETE);
++
++    pcre2_pattern_info(code, PCRE2_INFO_CAPTURECOUNT, &captureCount);
++    regexpPtr->pcre = code;
++    regexpPtr->pcreMatch = pcre2_match_data_create_from_pattern(code, NULL);
++    regexpPtr->re.re_nsub = captureCount;
++    return TCL_OK;
++}
++
++/*
++ *----------------------------------------------------------------------
++ *
++ * PcreCharOffset --
++ *
++ *	Convert a byte offset in a match subject into a character offset
++ *	relative to the byte offset "base".
++ *
++ *----------------------------------------------------------------------
++ */
++
++static inline Tcl_Size
++PcreCharOffset(
++    const char *subject,
++    int isBytes,
++    PCRE2_SIZE base,
++    PCRE2_SIZE offset)
++{
++    if (isBytes) {
++	return (Tcl_Size) offset - (Tcl_Size) base;
++    } else if (offset >= base) {
++	return TclNumUtfChars(subject + base, (Tcl_Size) (offset - base));
++    } else {
++	return -TclNumUtfChars(subject + offset, (Tcl_Size) (base - offset));
++    }
++}
++
++/*
++ *----------------------------------------------------------------------
++ *
++ * PcreExec --
++ *
++ *	Match a PCRE against a Tcl_Obj, starting at offset (a character
++ *	index, or a byte offset if flags has TCL_REG_BYTEOFFSET).
++ *
++ * Results:
++ *	1 for a match, 0 for no match, -1 for an error (with a message in
++ *	interp).  On a match, regexpPtr->matches[] holds the match ranges
++ *	relative to offset, in the same units as offset (as the classic
++ *	engine does); unmatched subexpressions are set to -1.
++ *
++ *----------------------------------------------------------------------
++ */
++
++static int
++PcreExec(
++    Tcl_Interp *interp,
++    TclRegexp *regexpPtr,
++    Tcl_Obj *textObj,
++    Tcl_Size offset,
++    int flags)
++{
++    const char *subject;
++    char *copy;
++    Tcl_Size length, i, nsubs = regexpPtr->re.re_nsub;
++    PCRE2_SIZE byteOffset, *ovector;
++    uint32_t options = 0;
++    int match, isBytes, byteOffsets = (flags & TCL_REG_BYTEOFFSET);
++
++    subject = PcreSubject(textObj, &length, &isBytes, &copy);
++    if (offset < 0) {
++	offset = 0;
++    }
++    if (byteOffsets || isBytes) {
++	if (offset > length) {
++	    offset = length;
++	}
++	byteOffset = offset;
++    } else {
++	Tcl_Size numChars = Tcl_GetCharLength(textObj);
++
++	if (offset > numChars) {
++	    offset = numChars;
++	}
++	byteOffset = Tcl_UtfAtIndex(subject, offset) - subject;
++	if (byteOffset > (PCRE2_SIZE) length) {
++	    byteOffset = length;
++	}
++    }
++    if (flags & TCL_REG_NOTBOL) {
++	options |= PCRE2_NOTBOL;
++    }
++
++    match = pcre2_match(regexpPtr->pcre, (PCRE2_SPTR) subject, length,
++	    byteOffset, options, regexpPtr->pcreMatch, NULL);
++    regexpPtr->details.rm_extend.rm_so = TCL_INDEX_NONE;
++    regexpPtr->details.rm_extend.rm_eo = TCL_INDEX_NONE;
++    if (match == PCRE2_ERROR_NOMATCH) {
++	if (copy) {
++	    Tcl_Free(copy);
++	}
++	return 0;
++    } else if (match < 0) {
++	if (copy) {
++	    Tcl_Free(copy);
++	}
++	PcreError(interp, "pcre2_match error: ", match);
++	return -1;
++    }
++
++    ovector = pcre2_get_ovector_pointer(regexpPtr->pcreMatch);
++    for (i = 0; i <= nsubs; i++) {
++	if ((i < match) && (ovector[2*i] != PCRE2_UNSET)) {
++	    int bytes = isBytes || byteOffsets;
++
++	    regexpPtr->matches[i].rm_so = (size_t) PcreCharOffset(subject,
++		    bytes, byteOffset, ovector[2*i]);
++	    regexpPtr->matches[i].rm_eo = (size_t) PcreCharOffset(subject,
++		    bytes, byteOffset, ovector[2*i+1]);
++	} else {
++	    regexpPtr->matches[i].rm_so = (size_t) TCL_INDEX_NONE;
++	    regexpPtr->matches[i].rm_eo = (size_t) TCL_INDEX_NONE;
++	}
++    }
++    if (copy) {
++	Tcl_Free(copy);
++    }
++    return 1;
++}
++#endif /* HAVE_PCRE */
++
++/*
++ *----------------------------------------------------------------------
++ *
++ * TclRegexpPCRE --
++ *
++ *	This procedure implements the [regexp] command for a PCRE regexp.
++ *	(The arguments are as for the classic engine; objv starts with the
++ *	pattern.)
++ *
++ * Results:
++ *	A standard Tcl result.
++ *
++ * Side effects:
++ *	See the user documentation.
++ *
++ *----------------------------------------------------------------------
++ */
++
++int
++TclRegexpPCRE(
++    Tcl_Interp *interp,		/* Current interpreter. */
++    Tcl_Size objc,		/* Number of arguments. */
++    Tcl_Obj *const objv[],	/* Argument objects. */
++    Tcl_RegExp regExpr,
++    int all,
++    int indices,
++    int doinline,
++    Tcl_Size offset)		/* Character offset to start matching at. */
++{
++#ifdef HAVE_PCRE
++    TclRegexp *regexpPtr = (TclRegexp *) regExpr;
++    Tcl_Obj *objPtr = objv[1], *resultPtr = NULL;
++    const char *subject;
++    char *copy;
++    Tcl_Size i, length, numVars;
++    PCRE2_SIZE byteOffset, *ovector;
++    uint32_t options = 0;
++    int match, isBytes, code = TCL_OK;
++
++    subject = PcreSubject(objPtr, &length, &isBytes, &copy);
++    if (offset > 0) {
++	/*
++	 * Translate offset into correct placement for utf-8 chars.  Add flag
++	 * if using offset (string is part of a larger string), so that "^"
++	 * won't match.
++	 */
++
++	if (isBytes) {
++	    byteOffset = (offset > length) ? length : offset;
++	} else {
++	    Tcl_Size numChars = Tcl_GetCharLength(objPtr);
++
++	    if (offset > numChars) {
++		offset = numChars;
++	    }
++	    byteOffset = Tcl_UtfAtIndex(subject, offset) - subject;
++	}
++	options |= PCRE2_NOTBOL;
++    } else {
++	byteOffset = 0;
++    }
++
++    objc -= 2;
++    objv += 2;
++    numVars = objc;
++
++    /*
++     * The following loop is to handle multiple matches within the same source
++     * string; each iteration handles one match. If "-all" hasn't been
++     * specified then the loop body only gets executed once. We terminate the
++     * loop when the starting offset is past the end of the string.
++     */
++
++    ovector = pcre2_get_ovector_pointer(regexpPtr->pcreMatch);
++    while (1) {
++	match = pcre2_match(regexpPtr->pcre, (PCRE2_SPTR) subject, length,
++		byteOffset, options, regexpPtr->pcreMatch, NULL);
++
++	if (match == PCRE2_ERROR_NOMATCH) {
++	    /*
++	     * We want to set the value of the interpreter result only when
++	     * this is the first time through the loop.
++	     */
++
++	    if (all <= 1) {
++		/*
++		 * If inlining, the interpreter's object result remains an
++		 * empty list, otherwise set it to an integer object w/ value
++		 * 0.
++		 */
++
++		if (!doinline) {
++		    Tcl_SetObjResult(interp, Tcl_NewWideIntObj(0));
++		}
++		goto done;
++	    }
++	    break;
++	} else if (match < 0) {
++	    if (resultPtr) {
++		Tcl_DecrRefCount(resultPtr);
++	    }
++	    PcreError(interp, "pcre2_match error: ", match);
++	    code = TCL_ERROR;
++	    goto done;
++	}
++
++	/*
++	 * If additional variable names have been specified, return index
++	 * information in those variables.
++	 */
++
++	if (doinline) {
++	    /*
++	     * It's the number of substitutions, plus one for the matchVar at
++	     * index 0
++	     */
++
++	    numVars = match;
++	    if (all <= 1) {
++		TclNewObj(resultPtr);
++	    }
++	}
++	for (i = 0; i < numVars; i++) {
++	    Tcl_Obj *newPtr;
++	    int matched = (i < match) && (ovector[2*i] != PCRE2_UNSET);
++
++	    if (indices) {
++		Tcl_Obj *objs[2];
++
++		if (matched) {
++		    Tcl_Size start = PcreCharOffset(subject, isBytes, 0,
++			    ovector[2*i]);
++		    Tcl_Size end = PcreCharOffset(subject, isBytes, 0,
++			    ovector[2*i+1]);
++
++		    TclNewIndexObj(objs[0], start);
++		    TclNewIndexObj(objs[1], end - 1);
++		} else {
++		    TclNewIndexObj(objs[0], TCL_INDEX_NONE);
++		    TclNewIndexObj(objs[1], TCL_INDEX_NONE);
++		}
++		newPtr = Tcl_NewListObj(2, objs);
++	    } else if (matched) {
++		Tcl_Size start = (Tcl_Size) ovector[2*i];
++		Tcl_Size len = (Tcl_Size) (ovector[2*i+1] - ovector[2*i]);
++
++		if (isBytes) {
++		    newPtr = Tcl_NewByteArrayObj(
++			    (const unsigned char *) subject + start, len);
++		} else if (copy) {
++		    /* Don't put raw NULs into a string rep. */
++		    Tcl_Size first = PcreCharOffset(subject, 0, 0, start);
++
++		    if (len == 0) {
++			TclNewObj(newPtr);
++		    } else {
++			newPtr = Tcl_GetRange(objPtr, first, first - 1
++				+ PcreCharOffset(subject, 0, start,
++				ovector[2*i+1]));
++		    }
++		} else {
++		    newPtr = Tcl_NewStringObj(subject + start, len);
++		}
++	    } else {
++		TclNewObj(newPtr);
++	    }
++	    if (doinline) {
++		if (Tcl_ListObjAppendElement(interp, resultPtr, newPtr)
++			!= TCL_OK) {
++		    Tcl_DecrRefCount(newPtr);
++		    Tcl_DecrRefCount(resultPtr);
++		    code = TCL_ERROR;
++		    goto done;
++		}
++	    } else {
++		if (Tcl_ObjSetVar2(interp, objv[i], NULL, newPtr,
++			TCL_LEAVE_ERR_MSG) == NULL) {
++		    code = TCL_ERROR;
++		    goto done;
++		}
++	    }
++	}
++
++	if (all == 0) {
++	    break;
++	}
++
++	/*
++	 * Adjust the offset to the character just after the last one in the
++	 * matchVar and increment all to count how many times we are making a
++	 * match. We always increment the offset by at least one character to
++	 * prevent endless looping (as in the case: regexp -all {a*} a).
++	 * ovector[1] is the match end point of the full RE match.
++	 */
++
++	if (ovector[0] == ovector[1]) {
++	    if (isBytes || (UCHAR(subject[ovector[1]]) < 0x80)) {
++		byteOffset = ovector[1] + 1;
++	    } else {
++		byteOffset = Tcl_UtfNext(subject + ovector[1]) - subject;
++	    }
++	} else {
++	    byteOffset = ovector[1];
++	}
++	all++;
++	options |= PCRE2_NOTBOL;
++	if (byteOffset >= (PCRE2_SIZE) length) {
++	    break;
++	}
++    }
++
++    /*
++     * Set the interpreter's object result to an integer object with value 1
++     * if -all wasn't specified, otherwise it's all-1 (the number of times
++     * through the while - 1).
++     */
++
++    if (doinline) {
++	Tcl_SetObjResult(interp, resultPtr);
++    } else {
++	Tcl_SetObjResult(interp, Tcl_NewWideIntObj(all ? all-1 : 1));
++    }
++  done:
++    if (copy) {
++	Tcl_Free(copy);
++    }
++    return code;
++#else /* !HAVE_PCRE */
++    (void) objc; (void) objv; (void) regExpr; (void) all; (void) indices;
++    (void) doinline; (void) offset;
++    Tcl_SetObjResult(interp, Tcl_NewStringObj("PCRE not available",
++	    TCL_INDEX_NONE));
++    return TCL_ERROR;
++#endif /* HAVE_PCRE */
++}
++
+ /*
+  *----------------------------------------------------------------------
+  *
+  * Tcl_RegExpCompile --
+  *
+@@ -212,10 +764,21 @@ Tcl_RegExpExec(
+      */
+ 
+     regexp->string = text;
+     regexp->objPtr = NULL;
+ 
++#ifdef HAVE_PCRE
++    if (regexp->flags & TCL_REG_PCRE) {
++	Tcl_Obj *textObj = Tcl_NewStringObj(text, TCL_INDEX_NONE);
++
++	Tcl_IncrRefCount(textObj);
++	result = PcreExec(interp, regexp, textObj, 0, flags);
++	Tcl_DecrRefCount(textObj);
++	return result;
++    }
++#endif
++
+     /*
+      * Convert the string to Unicode and perform the match.
+      */
+ 
+     Tcl_DStringInit(&ds);
+@@ -479,10 +1042,22 @@ Tcl_RegExpExecObj(
+      */
+ 
+     regexpPtr->string = NULL;
+     regexpPtr->objPtr = textObj;
+ 
++    if (reflags & TCL_REG_PCRE) {
++#ifdef HAVE_PCRE
++	return PcreExec(interp, regexpPtr, textObj, offset, flags);
++#else
++	if (interp != NULL) {
++	    Tcl_SetObjResult(interp, Tcl_NewStringObj(
++		    "PCRE not available", TCL_INDEX_NONE));
++	}
++	return -1;
++#endif
++    }
++
+     udata = Tcl_GetUnicodeFromObj(textObj, &length);
+ 
+     if (offset > length) {
+ 	offset = length;
+     }
+@@ -597,10 +1172,19 @@ Tcl_GetRegExpFromObj(
+     TclRegexp *regexpPtr;
+     const char *pattern;
+ 
+     RegexpGetInternalRep(objPtr, regexpPtr);
+ 
++    /*
++     * Use the PCRE engine if that is this interp's default (see "interp
++     * regexp").
++     */
++
++    if ((interp != NULL) && (((Interp *) interp)->flags & INTERP_PCRE)) {
++	flags |= TCL_REG_PCRE;
++    }
++
+     if ((regexpPtr == NULL) || (regexpPtr->flags != flags)) {
+ 	pattern = TclGetStringFromObj(objPtr, &length);
+ 
+ 	regexpPtr = CompileRegexp(interp, pattern, length, flags);
+ 	if (regexpPtr == NULL) {
+@@ -915,52 +1499,72 @@ CompileRegexp(
+     /*
+      * This is a new expression, so compile it and add it to the cache.
+      */
+ 
+     regexpPtr = (TclRegexp*)Tcl_Alloc(sizeof(TclRegexp));
++    memset(regexpPtr, 0, sizeof(TclRegexp));
+     regexpPtr->objPtr = NULL;
+     regexpPtr->string = NULL;
+     regexpPtr->details.rm_extend.rm_so = TCL_INDEX_NONE;
+     regexpPtr->details.rm_extend.rm_eo = TCL_INDEX_NONE;
+-
+-    /*
+-     * Get the up-to-date string representation and map to unicode.
+-     */
+-
+-    Tcl_DStringInit(&stringBuf);
+-    uniString = Tcl_UtfToUniCharDString(string, length, &stringBuf);
+-    numChars = Tcl_DStringLength(&stringBuf) / sizeof(Tcl_UniChar);
+-
+-    /*
+-     * Compile the string and check for errors.
+-     */
+-
+     regexpPtr->flags = flags;
+-    status = TclReComp(&regexpPtr->re, uniString, (size_t)numChars, flags);
+-    Tcl_DStringFree(&stringBuf);
+-
+-    if (status != REG_OKAY) {
+-	/*
+-	 * Clean up and report errors in the interpreter, if possible.
+-	 */
+ 
++    if (flags & TCL_REG_PCRE) {
++#ifdef HAVE_PCRE
++	if (PcreCompile(interp, regexpPtr, string, length) != TCL_OK) {
++	    Tcl_Free(regexpPtr);
++	    return NULL;
++	}
++#else
+ 	Tcl_Free(regexpPtr);
+ 	if (interp) {
+-	    TclRegError(interp,
+-		    "cannot compile regular expression pattern: ", status);
++	    Tcl_SetObjResult(interp, Tcl_NewStringObj(
++		    "couldn't compile pcre pattern: pcre unavailable",
++		    TCL_INDEX_NONE));
+ 	}
+ 	return NULL;
++#endif
++    } else {
++	/*
++	 * Get the up-to-date string representation and map to unicode.
++	 */
++
++	Tcl_DStringInit(&stringBuf);
++	uniString = Tcl_UtfToUniCharDString(string, length, &stringBuf);
++	numChars = Tcl_DStringLength(&stringBuf) / sizeof(Tcl_UniChar);
++
++	/*
++	 * Compile the string and check for errors.
++	 */
++
++	status = TclReComp(&regexpPtr->re, uniString, (size_t)numChars, flags);
++	Tcl_DStringFree(&stringBuf);
++
++	if (status != REG_OKAY) {
++	    /*
++	     * Clean up and report errors in the interpreter, if possible.
++	     */
++
++	    Tcl_Free(regexpPtr);
++	    if (interp) {
++		TclRegError(interp,
++			"cannot compile regular expression pattern: ", status);
++	    }
++	    return NULL;
++	}
+     }
+ 
+     /*
+      * Convert RE to a glob pattern equivalent, if any, and cache it.  If this
+      * is not possible, then globObjPtr will be NULL.  This is used by
+      * Tcl_RegExpExecObj to optionally do a fast match (avoids RE engine).
++     * The conversion only understands Tcl's own RE syntax, so it is not done
++     * for PCRE patterns.
+      */
+ 
+-    if (TclReToGlob(NULL, string, length, &stringBuf, &exact,
+-	    NULL) == TCL_OK) {
++    if (!(flags & TCL_REG_PCRE) && TclReToGlob(NULL, string, length,
++	    &stringBuf, &exact, NULL) == TCL_OK) {
+ 	regexpPtr->globObjPtr = Tcl_DStringToObj(&stringBuf);
+ 	Tcl_IncrRefCount(regexpPtr->globObjPtr);
+     } else {
+ 	regexpPtr->globObjPtr = NULL;
+     }
+@@ -1023,10 +1627,16 @@ CompileRegexp(
+ 
+ static void
+ FreeRegexp(
+     TclRegexp *regexpPtr)	/* Compiled regular expression to free. */
+ {
++#ifdef HAVE_PCRE
++    if (regexpPtr->flags & TCL_REG_PCRE) {
++	pcre2_match_data_free(regexpPtr->pcreMatch);
++	pcre2_code_free(regexpPtr->pcre);
++    } else
++#endif
+     TclReFree(&regexpPtr->re);
+     if (regexpPtr->globObjPtr) {
+ 	TclDecrRefCount(regexpPtr->globObjPtr);
+     }
+     if (regexpPtr->matches) {
+diff --git i/generic/tclRegexp.h w/generic/tclRegexp.h
+index 89d6c3a1b374..ba93009f5ad1 100644
+--- i/generic/tclRegexp.h
++++ w/generic/tclRegexp.h
+@@ -14,10 +14,17 @@
+ #ifndef _TCLREGEXP
+ #define _TCLREGEXP
+ 
+ #include "regex.h"
+ 
++#ifdef HAVE_PCRE
++#ifndef PCRE2_CODE_UNIT_WIDTH
++#define PCRE2_CODE_UNIT_WIDTH 8
++#endif
++#include <pcre2.h>
++#endif
++
+ /*
+  * The TclRegexp structure encapsulates a compiled regex_t, the flags that
+  * were used to compile it, and an array of pointers that are used to indicate
+  * subexpressions after a call to Tcl_RegExpExec. Note that the string and
+  * objPtr are mutually exclusive. These values are needed by Tcl_RegExpRange
+@@ -26,10 +33,15 @@
+ 
+ typedef struct TclRegexp {
+     int flags;			/* Regexp compile flags. */
+     regex_t re;			/* Compiled re, includes number of
+ 				 * subexpressions. */
++#ifdef HAVE_PCRE
++    pcre2_code *pcre;		/* Compiled PCRE (if flags & TCL_REG_PCRE). The
++				 * number of subexpressions is in re.re_nsub */
++    pcre2_match_data *pcreMatch;/* PCRE match data (ovector). */
++#endif
+     const char *string;		/* Last string passed to Tcl_RegExpExec. */
+     Tcl_Obj *objPtr;		/* Last object passed to Tcl_RegExpExecObj. */
+     Tcl_Obj *globObjPtr;	/* Glob pattern rep of RE or NULL if none. */
+     regmatch_t *matches;	/* Array of indices into the Tcl_UniChar
+ 				 * representation of the last string matched
+diff --git i/library/init.tcl w/library/init.tcl
+index 7fee542b64d6..e48ceb85a9f4 100644
+--- i/library/init.tcl
++++ w/library/init.tcl
+@@ -591,5 +591,10 @@ proc tcl::CopyDirectory {action src dest} {
+ 	    file copy -force -- $s [file join $dest [file tail $s]]
+ 	}
+     }
+     return
+ }
++
++# Load the L language runtime library (not available in safe interps).
++if {![interp issafe]} {
++    source [file join $::tcl_library libl.tcl]
++}
+diff --git i/library/tm.tcl w/library/tm.tcl
+index ae3c6f418212..6d089fac9f68 100644
+--- i/library/tm.tcl
++++ w/library/tm.tcl
+@@ -47,11 +47,11 @@ namespace eval ::tcl::tm {
+ 
+     variable paths {}
+ 
+     # The regex pattern a file name has to match to make it a Tcl Module.
+ 
+-    set pkgpattern {^([_[:alpha:]][:_[:alnum:]]*)-([[:digit:]].*)[.]tm$}
++    set pkgpattern {^([_[:alpha:]][\:_[:alnum:]]*)-([[:digit:]].*)[.]tm$}
+ 
+     # Export the public API
+ 
+     namespace export path
+     namespace ensemble create -command path -subcommands {add remove list}
+diff --git i/license.terms w/license.terms
+index d8049cd9e7ca..0c99e7f56d2c 100644
+--- i/license.terms
++++ w/license.terms
+@@ -1,9 +1,9 @@
+ This software is copyrighted by the Regents of the University of
+ California, Sun Microsystems, Inc., Scriptics Corporation, ActiveState
+-Corporation and other parties.  The following terms apply to all files
+-associated with the software unless explicitly disclaimed in
++Corporation, BitMover Inc, and other parties.  The following terms apply
++to all files associated with the software unless explicitly disclaimed in
+ individual files.
+ 
+ The authors hereby grant permission to use, copy, modify, distribute,
+ and license this software and its documentation for any purpose, provided
+ that existing copyright notices are retained in all copies and that this
+diff --git i/tests/interp.test w/tests/interp.test
+index 99a92b263716..dafd5590a781 100644
+--- i/tests/interp.test
++++ w/tests/interp.test
+@@ -11,10 +11,11 @@
+ # of this file, and for a DISCLAIMER OF ALL WARRANTIES.
+ 
+ if {"::tcltest" ni [namespace children]} {
+     package require tcltest 2.5
+     namespace import -force ::tcltest::*
++testConstraint pcre [expr {![catch {regexp -type pcre {a} a}]}]
+ }
+ source [file join [file dirname [info script]] tcltests.tcl]
+ 
+ ::tcltest::loadTestedCommands
+ catch [list package require -exact tcl::test [info patchlevel]]
+@@ -67,11 +68,11 @@ foreach i [interp children] {
+ test interp-1.1 {options for interp command} -returnCodes error -body {
+     interp
+ } -result {wrong # args: should be "interp cmd ?arg ...?"}
+ test interp-1.2 {options for interp command} -returnCodes error -body {
+     interp frobox
+-} -result {bad option "frobox": must be alias, aliases, bgerror, cancel, children, create, debug, delete, eval, exists, expose, hide, hidden, issafe, invokehidden, limit, marktrusted, recursionlimit, set, share, target, or transfer}
++} -result {bad option "frobox": must be alias, aliases, bgerror, cancel, children, create, debug, delete, eval, exists, expose, hide, hidden, issafe, invokehidden, limit, marktrusted, recursionlimit, regexp, set, share, target, or transfer}
+ test interp-1.3 {options for interp command} {
+     interp delete
+ } ""
+ test interp-1.4 {options for interp command} -returnCodes error -body {
+     interp delete foo bar
+@@ -85,17 +86,17 @@ test interp-1.5 {options for interp command} -returnCodes error -body {
+ test interp-1.6 {options for interp command} -returnCodes error -body {
+     interp children foo bar zop
+ } -result {wrong # args: should be "interp children ?path?"}
+ test interp-1.7 {options for interp command} -returnCodes error -body {
+     interp hello
+-} -result {bad option "hello": must be alias, aliases, bgerror, cancel, children, create, debug, delete, eval, exists, expose, hide, hidden, issafe, invokehidden, limit, marktrusted, recursionlimit, set, share, target, or transfer}
++} -result {bad option "hello": must be alias, aliases, bgerror, cancel, children, create, debug, delete, eval, exists, expose, hide, hidden, issafe, invokehidden, limit, marktrusted, recursionlimit, regexp, set, share, target, or transfer}
+ test interp-1.8 {options for interp command} -returnCodes error -body {
+     interp -froboz
+-} -result {bad option "-froboz": must be alias, aliases, bgerror, cancel, children, create, debug, delete, eval, exists, expose, hide, hidden, issafe, invokehidden, limit, marktrusted, recursionlimit, set, share, target, or transfer}
++} -result {bad option "-froboz": must be alias, aliases, bgerror, cancel, children, create, debug, delete, eval, exists, expose, hide, hidden, issafe, invokehidden, limit, marktrusted, recursionlimit, regexp, set, share, target, or transfer}
+ test interp-1.9 {options for interp command} -returnCodes error -body {
+     interp -froboz -safe
+-} -result {bad option "-froboz": must be alias, aliases, bgerror, cancel, children, create, debug, delete, eval, exists, expose, hide, hidden, issafe, invokehidden, limit, marktrusted, recursionlimit, set, share, target, or transfer}
++} -result {bad option "-froboz": must be alias, aliases, bgerror, cancel, children, create, debug, delete, eval, exists, expose, hide, hidden, issafe, invokehidden, limit, marktrusted, recursionlimit, regexp, set, share, target, or transfer}
+ test interp-1.10 {options for interp command} -returnCodes error -body {
+     interp target
+ } -result {wrong # args: should be "interp target path alias"}
+ test interp-1.11 {options for interp child command} -returnCodes error -setup {
+     interp create child
+@@ -4181,10 +4182,36 @@ namespace eval tcl::test::postinit {
+ }
+ 
+ namespace delete tcl::test::postinit
+ 
+ 
++test interp-41.1 {interp regexp} -returnCodes error -body {
++    interp regexp
++} -result {wrong # args: should be "interp regexp path ?type?"}
++test interp-41.2 {interp regexp} -returnCodes error -body {
++    interp regexp {} invalid
++} -result {bad type "invalid": must be classic or pcre}
++test interp-41.3 {interp regexp} -returnCodes error -body {
++    interp regexp {} classic bogus
++} -result {wrong # args: should be "interp regexp path ?type?"}
++test interp-41.4 {interp regexp} -setup {
++    interp create child
++} -body {
++    list [child eval {interp regexp {} classic}] \
++	[child eval {regexp {\mfoo} {a foo}}]
++} -cleanup {
++    interp delete child
++} -result {classic 1}
++test interp-41.5 {interp regexp} -constraints pcre -setup {
++    interp create child
++} -body {
++    list [child eval {interp regexp {} pcre}] \
++	[child eval {regexp {\bfoo\b} {a foo}}] [interp regexp child]
++} -cleanup {
++    interp delete child
++} -result {pcre 1 pcre}
++
+ # cleanup
+ unset -nocomplain hidden_cmds
+ foreach i [interp children] {
+     interp delete $i
+ }
+diff --git i/tests/regexp.test w/tests/regexp.test
+index 6bb371920417..fd9f9d89cba3 100644
+--- i/tests/regexp.test
++++ w/tests/regexp.test
+@@ -12,10 +12,11 @@
+ # of this file, and for a DISCLAIMER OF ALL WARRANTIES.
+ 
+ if {"::tcltest" ni [namespace children]} {
+     package require tcltest 2.5
+     namespace import -force ::tcltest::*
++testConstraint pcre [expr {![catch {regexp -type pcre {a} a}]}]
+ }
+ 
+ unset -nocomplain foo
+ source [file join [file dirname [info script]] tcltests.tcl]
+ testConstraint exec [llength [info commands exec]]
+@@ -270,11 +271,11 @@ test regexp-6.1 {regexp errors} {
+ test regexp-6.2 {regexp errors} {
+     list [catch {regexp -nocase a} msg] $msg
+ } {1 {wrong # args: should be "regexp ?-option ...? exp string ?matchVar? ?subMatchVar ...?"}}
+ test regexp-6.3 {regexp errors} {
+     list [catch {regexp -gorp a} msg] $msg
+-} {1 {bad option "-gorp": must be -all, -about, -indices, -inline, -expanded, -line, -linestop, -lineanchor, -nocase, -start, or --}}
++} {1 {bad option "-gorp": must be -all, -about, -indices, -inline, -expanded, -line, -linestop, -lineanchor, -nocase, -start, -type, or --}}
+ test regexp-6.4 {regexp errors} {
+     list [catch {regexp a( b} msg] $msg
+ } {1 {cannot compile regular expression pattern: parentheses () not balanced}}
+ test regexp-6.5 {regexp errors} {
+     list [catch {regexp a( b} msg] $msg
+@@ -476,11 +477,11 @@ test regexp-11.3 {regsub errors} {
+ test regexp-11.4 {regsub errors} {
+     list [catch {regsub a b c d e f} msg] $msg
+ } {1 {wrong # args: should be "regsub ?-option ...? exp string subSpec ?varName?"}}
+ test regexp-11.5 {regsub errors} {
+     list [catch {regsub -gorp a b c} msg] $msg
+-} {1 {bad option "-gorp": must be -all, -command, -expanded, -line, -linestop, -lineanchor, -nocase, -start, or --}}
++} {1 {bad option "-gorp": must be -all, -command, -expanded, -line, -linestop, -lineanchor, -nocase, -start, -submatches, -type, or --}}
+ test regexp-11.6 {regsub errors} {
+     list [catch {regsub -nocase a( b c d} msg] $msg
+ } {1 {cannot compile regular expression pattern: parentheses () not balanced}}
+ test regexp-11.7 {regsub errors} -setup {
+     unset -nocomplain f1
+@@ -1203,10 +1204,29 @@ test regexp-27.12 {regsub -command representation smash} {
+ test regexp-28.1 {bug cb03e57a7b} -returnCodes error -body {
+ 	regexp {} $nosuchvar
+ } -result {can't read "nosuchvar": no such variable}
+ 
+ 
++test regexp-40.1 {regexp -type pcre} -constraints pcre -body {
++    list [regexp -type pcre -inline {(\d+)-(\w+)} {x 12-ab y}] \
++	[regexp -type pcre -indices -inline {b+} {aabbb}] \
++	[regexp -type pcre -all {a} {banana}]
++} -result {{12-ab 12 ab} {{2 4}} 3}
++test regexp-40.2 {regexp -type classic} -body {
++    regexp -type classic {\mfoo\M} {a foo b}
++} -result 1
++test regexp-40.3 {regexp -type bad} -returnCodes error -body {
++    regexp -type bogus a a
++} -result {bad type "bogus": must be classic or pcre}
++test regexp-40.4 {regsub -type pcre escapes and -submatches} -constraints pcre -body {
++    list [regsub -type pcre -submatches {m0 m1} {(b+)} {abbc} {<\1>\t} s] \
++	$s $m0 $m1
++} -result [list 1 "a<bb>\tc" bb bb]
++test regexp-40.5 {regexp -type pcre with NUL in pattern} -constraints pcre -body {
++    regexp -type pcre "a\u0000b" "xa\u0000b"
++} -result 1
++
+ # cleanup
+ ::tcltest::cleanupTests
+ return
+ 
+ # Local Variables:
+diff --git i/tests/regexpComp.test w/tests/regexpComp.test
+index 41be002b7ec0..a171f9d30ca6 100644
+--- i/tests/regexpComp.test
++++ w/tests/regexpComp.test
+@@ -324,11 +324,11 @@ test regexpComp-6.2 {regexp errors} {
+ } {1 {wrong # args: should be "regexp ?-option ...? exp string ?matchVar? ?subMatchVar ...?"}}
+ test regexpComp-6.3 {regexp errors} {
+     evalInProc {
+ 	list [catch {regexp -gorp a} msg] $msg
+     }
+-} {1 {bad option "-gorp": must be -all, -about, -indices, -inline, -expanded, -line, -linestop, -lineanchor, -nocase, -start, or --}}
++} {1 {bad option "-gorp": must be -all, -about, -indices, -inline, -expanded, -line, -linestop, -lineanchor, -nocase, -start, -type, or --}}
+ test regexpComp-6.4 {regexp errors} {
+     evalInProc {
+ 	list [catch {regexp a( b} msg] $msg
+     }
+ } {1 {cannot compile regular expression pattern: parentheses () not balanced}}
+@@ -585,11 +585,11 @@ test regexpComp-11.4 {regsub errors} {
+ } {1 {wrong # args: should be "regsub ?-option ...? exp string subSpec ?varName?"}}
+ test regexpComp-11.5 {regsub errors} {
+     evalInProc {
+ 	list [catch {regsub -gorp a b c} msg] $msg
+     }
+-} {1 {bad option "-gorp": must be -all, -command, -expanded, -line, -linestop, -lineanchor, -nocase, -start, or --}}
++} {1 {bad option "-gorp": must be -all, -command, -expanded, -line, -linestop, -lineanchor, -nocase, -start, -submatches, -type, or --}}
+ test regexpComp-11.6 {regsub errors} {
+     evalInProc {
+ 	list [catch {regsub -nocase a( b c d} msg] $msg
+     }
+ } {1 {cannot compile regular expression pattern: parentheses () not balanced}}
+diff --git i/unix/Makefile.in w/unix/Makefile.in
+index c39305ca17fe..87e6ddefb8af 100644
+--- i/unix/Makefile.in
++++ w/unix/Makefile.in
+@@ -279,18 +279,26 @@ VALGRINDARGS		= --tool=memcheck --num-callers=24 \
+ #--------------------------------------------------------------------------
+ 
+ STUB_CC_SWITCHES = -I"${BUILD_DIR}" -I${UNIX_DIR} -I${GENERIC_DIR} -I${TOMMATH_DIR} \
+ 	${CFLAGS} ${CFLAGS_WARNING} ${SHLIB_CFLAGS} \
+ 	${AC_FLAGS} ${ENV_FLAGS} ${EXTRA_CFLAGS} @EXTRA_CC_SWITCHES@ \
+-	${NO_DEPRECATED_FLAGS} -DMP_FIXED_CUTOFFS
++	${NO_DEPRECATED_FLAGS} -DMP_FIXED_CUTOFFS ${PCRE_INCLUDE}
+ 
+ CC_SWITCHES = $(STUB_CC_SWITCHES) -DBUILD_tcl -DUTF8PROC_STATIC
+ 
+ APP_CC_SWITCHES = $(STUB_CC_SWITCHES) @EXTRA_APP_CC_SWITCHES@
+ 
+ LIBS		= @TCL_LIBS@
+ 
++# PCRE2 (for L and "regexp -type pcre"); PCRE_LIBS is already in TCL_LIBS.
++PCRE_INCLUDE	= @PCRE_INCLUDE@
++PCRE_LIBS	= @PCRE_LIBS@
++
++# Only needed to regenerate the L parser and scanner, see "make L-gen".
++BISON		= @BISON@
++FLEX		= @FLEX@
++
+ DEPEND_SWITCHES	= ${CFLAGS} -I${UNIX_DIR} -I${GENERIC_DIR} \
+ 	${AC_FLAGS} ${EXTRA_CFLAGS} @EXTRA_CC_SWITCHES@
+ 
+ TCLSH_OBJS = tclAppInit.o
+ 
+@@ -323,10 +331,12 @@ GENERIC_OBJS = regcomp.o regexec.o regfree.o regerror.o tclAlloc.o \
+ 	tclTomMathInterface.o tclZipfs.o
+ 
+ OO_OBJS = tclOO.o tclOOBasic.o tclOOCall.o tclOODefineCmds.o tclOOInfo.o \
+ 	tclOOMethod.o tclOOProp.o tclOOStubInit.o
+ 
++L_OBJS = Lscanner.o Lgrammar.o Lcompile.o Last.o Ltypecheck.o Lgetopt.o
++
+ TOMMATH_OBJS = bn_s_mp_reverse.o bn_s_mp_mul_digs_fast.o \
+ 	bn_s_mp_sqr_fast.o bn_mp_add.o bn_mp_and.o \
+ 	bn_mp_add_d.o bn_mp_clamp.o bn_mp_clear.o bn_mp_clear_multi.o \
+ 	bn_mp_cmp.o bn_mp_cmp_d.o bn_mp_cmp_mag.o \
+ 	bn_mp_cnt_lsb.o bn_mp_copy.o \
+@@ -374,11 +384,11 @@ DTRACE_OBJ = tclDTrace.o
+ 
+ ZLIB_OBJS = Zadler32.o Zcompress.o Zcrc32.o Zdeflate.o Zinfback.o \
+ 	Zinffast.o Zinflate.o Zinftrees.o Ztrees.o Zuncompr.o Zzutil.o
+ 
+ TCL_OBJS = ${GENERIC_OBJS} ${UNIX_OBJS} ${NOTIFY_OBJS} ${COMPAT_OBJS} \
+-	${OO_OBJS} @DL_OBJS@ @PLAT_OBJS@
++	${OO_OBJS} ${L_OBJS} @DL_OBJS@ @PLAT_OBJS@
+ 
+ OBJS = ${TCL_OBJS} ${UTF8PROC_OBJS} @DTRACE_OBJ@ @ZLIB_OBJS@ @TOMMATH_OBJS@
+ 
+ TCL_DECLS = \
+ 	$(GENERIC_DIR)/tcl.decls \
+@@ -490,10 +500,23 @@ GENERIC_SRCS = \
+ 	$(GENERIC_DIR)/tclVar.c \
+ 	$(GENERIC_DIR)/tclAssembly.c \
+ 	$(GENERIC_DIR)/tclZlib.c \
+ 	$(GENERIC_DIR)/tclZipfs.c
+ 
++L_HDRS = \
++	$(GENERIC_DIR)/Lcompile.h \
++	$(GENERIC_DIR)/Lgrammar.h \
++	$(GENERIC_DIR)/Last.h
++
++L_SRCS = \
++	$(GENERIC_DIR)/Lscanner-pregen.c \
++	$(GENERIC_DIR)/Lgrammar-pregen.c \
++	$(GENERIC_DIR)/Lcompile.c \
++	$(GENERIC_DIR)/Ltypecheck.c \
++	$(GENERIC_DIR)/Last.c \
++	$(GENERIC_DIR)/Lgetopt.c
++
+ OO_SRCS = \
+ 	$(GENERIC_DIR)/tclOO.c \
+ 	$(GENERIC_DIR)/tclOOBasic.c \
+ 	$(GENERIC_DIR)/tclOOCall.c \
+ 	$(GENERIC_DIR)/tclOODefineCmds.c \
+@@ -731,11 +754,11 @@ UTF8PROC_SRCS = \
+ # Note: don't include DL_SRCS or MAC_OSX_SRCS in SRCS: most of those files
+ # won't compile on the current machine, and they will cause problems for
+ # things like "make depend".
+ 
+ SRCS = $(GENERIC_SRCS) $(UNIX_SRCS) $(NOTIFY_SRCS) \
+-	$(OO_SRCS) $(UTF8PROC_SRCS) $(STUB_SRCS) \
++	$(OO_SRCS) $(L_SRCS) $(UTF8PROC_SRCS) $(STUB_SRCS) \
+ 	@PLAT_SRCS@ @ZLIB_SRCS@ @TOMMATH_SRCS@
+ 
+ ###
+ # Tip 430 - ZipFS Modifications
+ ###
+@@ -922,10 +945,15 @@ tcltest-real:
+ test: test-tcl test-packages
+ 
+ test-tcl: ${TCLTEST_EXE}
+ 	$(SHELL_ENV) ./${TCLTEST_EXE} $(TOP_DIR)/tests/all.tcl $(TESTFLAGS)
+ 
++# Run the L test suite.
++l-test l-tests test-l test-L: ${TCLTEST_EXE}
++	$(SHELL_ENV) ./${TCLTEST_EXE} $(TOP_DIR)/tests/all.tcl \
++		-file 'l-*.test' $(TESTFLAGS)
++
+ gdb-test: ${TCLTEST_EXE}
+ 	$(SHELL_ENV) $(GDB) --args ./${TCLTEST_EXE} $(TOP_DIR)/tests/all.tcl \
+ 		$(TESTFLAGS) -singleproc 1
+ 
+ lldb-test: ${TCLTEST_EXE}
+@@ -1373,11 +1401,11 @@ tclEnv.o: $(GENERIC_DIR)/tclEnv.c
+ 	$(CC) -c $(CC_SWITCHES) $(GENERIC_DIR)/tclEnv.c
+ 
+ tclEvent.o: $(GENERIC_DIR)/tclEvent.c tclUuid.h
+ 	$(CC) -c $(CC_SWITCHES) $(GENERIC_DIR)/tclEvent.c
+ 
+-tclExecute.o: $(GENERIC_DIR)/tclExecute.c $(COMPILEHDR) $(MATHHDRS) $(NREHDR)
++tclExecute.o: $(GENERIC_DIR)/tclExecute.c $(COMPILEHDR) $(MATHHDRS) $(NREHDR) $(L_HDRS)
+ 	$(CC) -c $(CC_SWITCHES) $(GENERIC_DIR)/tclExecute.c
+ 
+ tclFCmd.o: $(GENERIC_DIR)/tclFCmd.c
+ 	$(CC) -c $(CC_SWITCHES) $(GENERIC_DIR)/tclFCmd.c
+ 
+@@ -1564,10 +1592,39 @@ tclProcess.o: $(GENERIC_DIR)/tclProcess.c
+ 	$(CC) -c $(CC_SWITCHES) $(GENERIC_DIR)/tclProcess.c
+ 
+ tclRegexp.o: $(GENERIC_DIR)/tclRegexp.c $(TCLREHDRS)
+ 	$(CC) -c $(CC_SWITCHES) $(GENERIC_DIR)/tclRegexp.c
+ 
++#--------------------------------------------------------------------------
++# The L language. The parser and scanner are built from the pregenerated
++# sources; "make L-gen" regenerates those with bison and flex.
++#--------------------------------------------------------------------------
++
++L-gen:
++	cd $(GENERIC_DIR) && $(BISON) -pL_ --defines=Lgrammar.h \
++		-o Lgrammar-pregen.c Lgrammar.y
++	cd $(GENERIC_DIR) && $(FLEX) -PL_ -oLscanner-pregen.c Lscanner.l
++
++Lscanner.o: $(GENERIC_DIR)/Lscanner-pregen.c $(L_HDRS)
++	$(CC) -c $(CC_SWITCHES) -o $@ $(GENERIC_DIR)/Lscanner-pregen.c
++
++Lgrammar.o: $(GENERIC_DIR)/Lgrammar-pregen.c $(L_HDRS)
++	$(CC) -c $(CC_SWITCHES) -fno-strict-aliasing -o $@ \
++		$(GENERIC_DIR)/Lgrammar-pregen.c
++
++Lcompile.o: $(GENERIC_DIR)/Lcompile.c $(L_HDRS) $(COMPILEHDR)
++	$(CC) -c $(CC_SWITCHES) $(GENERIC_DIR)/Lcompile.c
++
++Ltypecheck.o: $(GENERIC_DIR)/Ltypecheck.c $(L_HDRS)
++	$(CC) -c $(CC_SWITCHES) $(GENERIC_DIR)/Ltypecheck.c
++
++Lgetopt.o: $(GENERIC_DIR)/Lgetopt.c $(L_HDRS)
++	$(CC) -c $(CC_SWITCHES) $(GENERIC_DIR)/Lgetopt.c
++
++Last.o: $(GENERIC_DIR)/Last.c $(L_HDRS)
++	$(CC) -c $(CC_SWITCHES) $(GENERIC_DIR)/Last.c
++
+ tclResolve.o: $(GENERIC_DIR)/tclResolve.c
+ 	$(CC) -c $(CC_SWITCHES) $(GENERIC_DIR)/tclResolve.c
+ 
+ tclResult.o: $(GENERIC_DIR)/tclResult.c
+ 	$(CC) -c $(CC_SWITCHES) $(GENERIC_DIR)/tclResult.c
+diff --git i/unix/configure w/unix/configure
+index 165c91f22496..3282ae0820c8 100755
+--- i/unix/configure
++++ w/unix/configure
+@@ -715,10 +715,14 @@ RANLIB
+ TOMMATH_INCLUDE
+ TOMMATH_SRCS
+ TOMMATH_OBJS
+ TCL_PC_CFLAGS
+ TCL_PC_REQUIRES_PRIVATE
++FLEX
++BISON
++PCRE_LIBS
++PCRE_INCLUDE
+ ZLIB_INCLUDE
+ ZLIB_SRCS
+ ZLIB_OBJS
+ TCLSH_PROG
+ SHARED_BUILD
+@@ -777,10 +781,12 @@ enable_option_checking
+ enable_man_symlinks
+ enable_man_compression
+ enable_man_suffix
+ with_encoding
+ enable_shared
++enable_pcre
++with_pcre
+ with_system_libtommath
+ enable_64bit
+ enable_64bit_vis
+ enable_rpath
+ enable_corefoundation
+@@ -1426,10 +1432,13 @@ Optional Features:
+   --enable-man-suffix=STRING
+                           use STRING as a suffix to manpage file names
+                           (default: no, tcl if enabled without
+                           specifying STRING)
+   --enable-shared         build and link with shared libraries (default: on)
++  --enable-pcre=yes|no|default
++                          build with PCRE2 support; "default" also makes PCRE
++                          the default RE engine (default: default)
+   --enable-64bit          enable 64bit support (default: off)
+   --enable-64bit-vis      enable 64bit Sparc VIS support (default: off)
+   --disable-rpath         disable rpath support (default: on)
+   --enable-corefoundation use CoreFoundation API on MacOSX (default: on)
+   --enable-load           allow dynamic loading and "load" command (default:
+@@ -1445,10 +1454,12 @@ Optional Features:
+ 
+ Optional Packages:
+   --with-PACKAGE[=ARG]    use PACKAGE [ARG=yes]
+   --without-PACKAGE       do not use PACKAGE (same as --with-PACKAGE=no)
+   --with-encoding         encoding for configuration values (default: utf-8)
++  --with-pcre=DIR         directory containing the PCRE2 include/ and lib/
++                          directories
+   --with-system-libtommath
+                           use external libtommath (default: true if available,
+                           false otherwise)
+   --with-tzdata           install timezone data (default: autodetect)
+ 
+@@ -5328,10 +5339,227 @@ then :
+ printf '%s\n' "#define TCL_WITH_INTERNAL_ZLIB 1" >>confdefs.h
+ 
+ 
+ fi
+ 
++#------------------------------------------------------------------------
++#	Add stuff for PCRE2 (used by L and by "regexp -type pcre")
++#------------------------------------------------------------------------
++
++
++    # Check whether --enable-pcre was given.
++if test ${enable_pcre+y}
++then :
++  enableval=$enable_pcre; tcl_pcre=$enableval
++else case e in #(
++  e) tcl_pcre=default ;;
++esac
++fi
++
++
++# Check whether --with-pcre was given.
++if test ${with_pcre+y}
++then :
++  withval=$with_pcre; with_pcre=${withval}
++fi
++
++    PCRE_INCLUDE=""
++    PCRE_LIBS=""
++    if test "$tcl_pcre" != "no"
++then :
++
++	{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking for PCRE2" >&5
++printf %s "checking for PCRE2... " >&6; }
++	if test x"${with_pcre}" != x
++then :
++
++	    PCRE_INCLUDE="-I${with_pcre}/include"
++	    PCRE_LIBS="-L${with_pcre}/lib -lpcre2-8"
++
++elif ${PKG_CONFIG:-pkg-config} --exists libpcre2-8 2>/dev/null
++then :
++
++	    PCRE_INCLUDE=`${PKG_CONFIG:-pkg-config} --cflags libpcre2-8`
++	    PCRE_LIBS=`${PKG_CONFIG:-pkg-config} --libs libpcre2-8`
++
++elif pcre2-config --version >/dev/null 2>&1
++then :
++
++	    PCRE_INCLUDE=`pcre2-config --cflags`
++	    PCRE_LIBS=`pcre2-config --libs8`
++
++else case e in #(
++  e)
++	    PCRE_LIBS="-lpcre2-8"
++	 ;;
++esac
++fi
++	tcl_save_CFLAGS="$CFLAGS"
++	tcl_save_LIBS="$LIBS"
++	CFLAGS="$CFLAGS $PCRE_INCLUDE"
++	LIBS="$LIBS $PCRE_LIBS"
++	cat confdefs.h - <<_ACEOF >conftest.$ac_ext
++/* end confdefs.h.  */
++
++#define PCRE2_CODE_UNIT_WIDTH 8
++#include <pcre2.h>
++
++int
++main (void)
++{
++
++int err; PCRE2_SIZE off;
++pcre2_code *re = pcre2_compile((PCRE2_SPTR) "a", 1, 0, &err, &off, NULL);
++pcre2_code_free(re);
++
++  ;
++  return 0;
++}
++_ACEOF
++if ac_fn_c_try_link "$LINENO"
++then :
++  tcl_pcre_found=yes
++else case e in #(
++  e) tcl_pcre_found=no ;;
++esac
++fi
++rm -f core conftest.err conftest.$ac_objext conftest.beam \
++    conftest$ac_exeext conftest.$ac_ext
++	CFLAGS="$tcl_save_CFLAGS"
++	LIBS="$tcl_save_LIBS"
++	{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $tcl_pcre_found" >&5
++printf '%s\n' "$tcl_pcre_found" >&6; }
++	if test "$tcl_pcre_found" = yes
++then :
++
++	    LIBS="$LIBS $PCRE_LIBS"
++
++printf '%s\n' "#define HAVE_PCRE 1" >>confdefs.h
++
++	    if test "$tcl_pcre" = default
++then :
++
++
++printf '%s\n' "#define USE_DEFAULT_PCRE 1" >>confdefs.h
++
++
++fi
++
++else case e in #(
++  e)
++	    as_fn_error $? "PCRE2 (libpcre2-8) not found; it is required by L. Use --with-pcre=DIR or --disable-pcre" "$LINENO" 5
++	 ;;
++esac
++fi
++
++fi
++
++
++
++
++    for ac_prog in bison
++do
++  # Extract the first word of "$ac_prog", so it can be a program name with args.
++set dummy $ac_prog; ac_word=$2
++{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking for $ac_word" >&5
++printf %s "checking for $ac_word... " >&6; }
++if test ${ac_cv_prog_BISON+y}
++then :
++  printf %s "(cached) " >&6
++else case e in #(
++  e) if test -n "$BISON"; then
++  ac_cv_prog_BISON="$BISON" # Let the user override the test.
++else
++as_save_IFS=$IFS; IFS=$PATH_SEPARATOR
++for as_dir in $PATH
++do
++  IFS=$as_save_IFS
++  case $as_dir in #(((
++    '') as_dir=./ ;;
++    */) ;;
++    *) as_dir=$as_dir/ ;;
++  esac
++    for ac_exec_ext in '' $ac_executable_extensions; do
++  if as_fn_executable_p "$as_dir$ac_word$ac_exec_ext"; then
++    ac_cv_prog_BISON="$ac_prog"
++    printf '%s\n' "$as_me:${as_lineno-$LINENO}: found $as_dir$ac_word$ac_exec_ext" >&5
++    break 2
++  fi
++done
++  done
++IFS=$as_save_IFS
++
++fi ;;
++esac
++fi
++BISON=$ac_cv_prog_BISON
++if test -n "$BISON"; then
++  { printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $BISON" >&5
++printf '%s\n' "$BISON" >&6; }
++else
++  { printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: no" >&5
++printf '%s\n' "no" >&6; }
++fi
++
++
++  test -n "$BISON" && break
++done
++test -n "$BISON" || BISON="no"
++
++    for ac_prog in flex
++do
++  # Extract the first word of "$ac_prog", so it can be a program name with args.
++set dummy $ac_prog; ac_word=$2
++{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking for $ac_word" >&5
++printf %s "checking for $ac_word... " >&6; }
++if test ${ac_cv_prog_FLEX+y}
++then :
++  printf %s "(cached) " >&6
++else case e in #(
++  e) if test -n "$FLEX"; then
++  ac_cv_prog_FLEX="$FLEX" # Let the user override the test.
++else
++as_save_IFS=$IFS; IFS=$PATH_SEPARATOR
++for as_dir in $PATH
++do
++  IFS=$as_save_IFS
++  case $as_dir in #(((
++    '') as_dir=./ ;;
++    */) ;;
++    *) as_dir=$as_dir/ ;;
++  esac
++    for ac_exec_ext in '' $ac_executable_extensions; do
++  if as_fn_executable_p "$as_dir$ac_word$ac_exec_ext"; then
++    ac_cv_prog_FLEX="$ac_prog"
++    printf '%s\n' "$as_me:${as_lineno-$LINENO}: found $as_dir$ac_word$ac_exec_ext" >&5
++    break 2
++  fi
++done
++  done
++IFS=$as_save_IFS
++
++fi ;;
++esac
++fi
++FLEX=$ac_cv_prog_FLEX
++if test -n "$FLEX"; then
++  { printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $FLEX" >&5
++printf '%s\n' "$FLEX" >&6; }
++else
++  { printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: no" >&5
++printf '%s\n' "no" >&6; }
++fi
++
++
++  test -n "$FLEX" && break
++done
++test -n "$FLEX" || FLEX="no"
++
++
++
++
++
+ #------------------------------------------------------------------------
+ #	Add stuff for libtommath
+ 
+ libtommath_ok=yes
+ 
+diff --git i/unix/configure.ac w/unix/configure.ac
+index a1855ea77312..60935607f92b 100644
+--- i/unix/configure.ac
++++ w/unix/configure.ac
+@@ -166,10 +166,17 @@ AS_IF([test $zlib_ok = no], [
+   AC_SUBST(ZLIB_SRCS,[\${ZLIB_SRCS}])
+   AC_SUBST(ZLIB_INCLUDE,[-I\${ZLIB_DIR}])
+   AC_DEFINE(TCL_WITH_INTERNAL_ZLIB, 1, [Tcl with internal zlib])
+ ])
+ 
++#------------------------------------------------------------------------
++#	Add stuff for PCRE2 (used by L and by "regexp -type pcre")
++#------------------------------------------------------------------------
++
++SC_ENABLE_PCRE
++SC_PROG_BISON_FLEX
++
+ #------------------------------------------------------------------------
+ #	Add stuff for libtommath
+ 
+ libtommath_ok=yes
+ AC_ARG_WITH(system-libtommath,
+diff --git i/unix/tcl.m4 w/unix/tcl.m4
+index 5ec91a39b25a..fe54ff58bc2d 100644
+--- i/unix/tcl.m4
++++ w/unix/tcl.m4
+@@ -487,10 +487,103 @@ AC_DEFUN([SC_BUILD_TCLSH], [
+     BUILD_TCLSH="${TCL_BIN_DIR}"/tclsh
+     AC_MSG_RESULT([$BUILD_TCLSH])
+     AC_SUBST(BUILD_TCLSH)
+ ])
+ 
++#------------------------------------------------------------------------
++# SC_ENABLE_PCRE --
++#
++#	Allows building with the PCRE2 regular expression library, which is
++#	used by the L language and by "regexp -type pcre".
++#
++# Arguments:
++#	none
++#
++# Results:
++#	Adds the following arguments to configure:
++#		--enable-pcre=yes|no|default
++#		--with-pcre=DIR
++#
++#	"default" (the default) also makes PCRE the default RE engine of new
++#	interps (overridable with TCL_REGEXP_CLASSIC in the environment).
++#
++#	Defines the following vars:
++#		PCRE_INCLUDE	Compiler flags for PCRE2
++#		PCRE_LIBS	Linker flags for PCRE2 (also added to LIBS)
++#		HAVE_PCRE	If PCRE2 support is enabled
++#		USE_DEFAULT_PCRE If PCRE is the default RE engine
++#------------------------------------------------------------------------
++
++AC_DEFUN([SC_ENABLE_PCRE], [
++    AC_ARG_ENABLE(pcre,
++	AS_HELP_STRING([--enable-pcre=yes|no|default],
++	    [build with PCRE2 support; "default" also makes PCRE the default RE engine (default: default)]),
++	[tcl_pcre=$enableval], [tcl_pcre=default])
++    AC_ARG_WITH(pcre,
++	AS_HELP_STRING([--with-pcre=DIR],
++	    [directory containing the PCRE2 include/ and lib/ directories]),
++	[with_pcre=${withval}])
++    PCRE_INCLUDE=""
++    PCRE_LIBS=""
++    AS_IF([test "$tcl_pcre" != "no"], [
++	AC_MSG_CHECKING([for PCRE2])
++	AS_IF([test x"${with_pcre}" != x], [
++	    PCRE_INCLUDE="-I${with_pcre}/include"
++	    PCRE_LIBS="-L${with_pcre}/lib -lpcre2-8"
++	], [${PKG_CONFIG:-pkg-config} --exists libpcre2-8 2>/dev/null], [
++	    PCRE_INCLUDE=`${PKG_CONFIG:-pkg-config} --cflags libpcre2-8`
++	    PCRE_LIBS=`${PKG_CONFIG:-pkg-config} --libs libpcre2-8`
++	], [pcre2-config --version >/dev/null 2>&1], [
++	    PCRE_INCLUDE=`pcre2-config --cflags`
++	    PCRE_LIBS=`pcre2-config --libs8`
++	], [
++	    PCRE_LIBS="-lpcre2-8"
++	])
++	tcl_save_CFLAGS="$CFLAGS"
++	tcl_save_LIBS="$LIBS"
++	CFLAGS="$CFLAGS $PCRE_INCLUDE"
++	LIBS="$LIBS $PCRE_LIBS"
++	AC_LINK_IFELSE([AC_LANG_PROGRAM([[
++#define PCRE2_CODE_UNIT_WIDTH 8
++#include <pcre2.h>
++	    ]], [[
++int err; PCRE2_SIZE off;
++pcre2_code *re = pcre2_compile((PCRE2_SPTR) "a", 1, 0, &err, &off, NULL);
++pcre2_code_free(re);
++	    ]])], [tcl_pcre_found=yes], [tcl_pcre_found=no])
++	CFLAGS="$tcl_save_CFLAGS"
++	LIBS="$tcl_save_LIBS"
++	AC_MSG_RESULT([$tcl_pcre_found])
++	AS_IF([test "$tcl_pcre_found" = yes], [
++	    LIBS="$LIBS $PCRE_LIBS"
++	    AC_DEFINE(HAVE_PCRE, 1, [Do we enable PCRE interfaces?])
++	    AS_IF([test "$tcl_pcre" = default], [
++		AC_DEFINE(USE_DEFAULT_PCRE, 1, [Use PCRE as default RE engine?])
++	    ])
++	], [
++	    AC_MSG_ERROR([PCRE2 (libpcre2-8) not found; it is required by L. Use --with-pcre=DIR or --disable-pcre])
++	])
++    ])
++    AC_SUBST(PCRE_INCLUDE)
++    AC_SUBST(PCRE_LIBS)
++])
++
++#------------------------------------------------------------------------
++# SC_PROG_BISON_FLEX --
++#
++#	Look for bison and flex, which are needed only to regenerate the L
++#	parser and scanner (pregenerated versions are used otherwise).
++#
++#------------------------------------------------------------------------
++
++AC_DEFUN([SC_PROG_BISON_FLEX], [
++    AC_CHECK_PROGS(BISON, [bison], [no])
++    AC_CHECK_PROGS(FLEX, [flex], [no])
++    AC_SUBST(BISON)
++    AC_SUBST(FLEX)
++])
++
+ #------------------------------------------------------------------------
+ # SC_ENABLE_SHARED --
+ #
+ #	Allows the building of shared libraries
+ #

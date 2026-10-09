@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build, test and package (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config curl \
+            libpcre2-dev zlib1g-dev \
+            libx11-dev libxft-dev libfontconfig-dev \
+            xvfb xauth imagemagick exif
+
+      - name: Cache Tcl/Tk downloads
+        uses: actions/cache@v4
+        with:
+          path: downloads
+          key: tcltk-${{ hashFiles('Makefile') }}
+
+      - name: Build L and L-gui
+        run: make all
+
+      - name: L test suite
+        run: |
+          mkdir -p build/logs
+          make test 2>&1 | tee build/logs/test-l.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Run the examples
+        run: |
+          mkdir -p build/logs
+          xvfb-run -a make examples 2>&1 | tee build/logs/examples.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Package
+        run: make dist
+
+      - name: Smoke-test the package
+        run: |
+          mkdir -p /tmp/l-dist
+          tar xzf dist/*.tar.gz -C /tmp/l-dist
+          cd /tmp/l-dist/little-lang-*
+          echo 'puts "Tcl [info patchlevel], L [Lver]"' | ./bin/L
+          printf 'void main() { printf("hello from %%s\\n", "L"); }\n' > /tmp/hello.l
+          ./bin/L /tmp/hello.l
+
+      - name: Upload binary package
+        uses: actions/upload-artifact@v4
+        with:
+          name: little-lang-linux-x86_64
+          path: dist/*.tar.gz
+
+      - name: Upload example output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: example-output
+          path: build/examples-out/
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-build
+          path: build/logs/
+          if-no-files-found: ignore
+
+  tcl-core:
+    name: Tcl core test suite (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config curl libpcre2-dev zlib1g-dev
+
+      - name: Cache Tcl/Tk downloads
+        uses: actions/cache@v4
+        with:
+          path: downloads
+          key: tcltk-${{ hashFiles('Makefile') }}
+
+      - name: Build
+        run: make tcl
+
+      - name: Tcl core tests
+        run: |
+          mkdir -p build/logs
+          make test-core 2>&1 | tee build/logs/test-core.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-tcl-core
+          path: build/logs/
+          if-no-files-found: ignore
