@@ -13,7 +13,7 @@ jobs:
     name: Build, test and package (Linux)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
@@ -21,11 +21,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config curl \
             libpcre2-dev zlib1g-dev \
-            libx11-dev libxft-dev libfontconfig-dev \
+            libx11-dev libxft-dev libfontconfig-dev libharfbuzz-dev \
+            libatk1.0-dev libatk-bridge2.0-dev libcups2-dev \
             xvfb xauth imagemagick exif
 
       - name: Cache Tcl/Tk downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: downloads
           key: tcltk-${{ hashFiles('Makefile') }}
@@ -58,14 +59,14 @@ jobs:
           ./bin/L /tmp/hello.l
 
       - name: Upload binary package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: little-lang-linux-x86_64
           path: dist/*.tar.gz
 
       - name: Upload example output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: example-output
           path: build/examples-out/
@@ -74,7 +75,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: logs-build
           path: build/logs/
@@ -84,7 +85,7 @@ jobs:
     name: Tcl core test suite (Linux)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
@@ -93,7 +94,7 @@ jobs:
             build-essential pkg-config curl libpcre2-dev zlib1g-dev
 
       - name: Cache Tcl/Tk downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: downloads
           key: tcltk-${{ hashFiles('Makefile') }}
@@ -109,7 +110,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: logs-tcl-core
           path: build/logs/

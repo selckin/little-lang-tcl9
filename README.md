@@ -26,8 +26,11 @@ L-enabled Tcl.
 
 Requirements: a C compiler, make, curl, pkg-config and PCRE2
 (`libpcre2-dev` on Debian/Ubuntu, `pcre2` on Homebrew); for L-gui also the
-X11 and Xft development files (`libx11-dev libxft-dev`).  bison and flex are
-only needed to regenerate the parser (`make regen`).
+X11, Xft and HarfBuzz development files (`libx11-dev libxft-dev
+libharfbuzz-dev`; Tk 9.1 needs HarfBuzz for bidirectional text, or add
+`--disable-bidi` to `TK_CONFIGURE_OPTS`).  Optionally `libatk-bridge2.0-dev`
+(accessibility) and `libcups2-dev` (printing).  bison and flex are only
+needed to regenerate the parser (`make regen`).
 
 ```sh
 make            # download Tcl/Tk 9.1.0, patch, build L and L-gui
