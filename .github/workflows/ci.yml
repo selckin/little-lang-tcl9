@@ -23,7 +23,7 @@ jobs:
             libpcre2-dev zlib1g-dev \
             libx11-dev libxft-dev libfontconfig-dev libharfbuzz-dev \
             libatk1.0-dev libatk-bridge2.0-dev libcups2-dev \
-            xvfb xauth imagemagick exif
+            xvfb xauth fonts-dejavu-core imagemagick exif
 
       - name: Cache Tcl/Tk downloads
         uses: actions/cache@v6

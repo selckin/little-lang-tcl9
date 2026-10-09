@@ -42,9 +42,7 @@ then
 	IM=convert
 	command -v magick >/dev/null 2>&1 && IM=magick
 	for c in red green blue orange; do
-		$IM -size 800x600 "gradient:$c-white" \
-			-pointsize 72 -gravity center -annotate 0 "$c" \
-			"$g/$c.jpg"
+		$IM -size 800x600 "gradient:$c-white" "$g/$c.jpg"
 	done
 	mkdir -p "$OUT/home"
 	(cd "$g" && HOME="$OUT/home" "$L" "$HERE/examples/photos.l" \
